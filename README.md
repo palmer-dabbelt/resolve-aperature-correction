@@ -1,4 +1,34 @@
-# resolve-aperture-correction
+# Automatically Correcting Exposure for Variable Aperture Lenses
+
+This repo contains a fuse (a DaVinci Resolve Fusion plugin) that automatically
+applies exposure correction for variable aperture lenses.
+
+Essentially it adjusts a gain parameter based on the different between the
+aperture the lens metadata reports per frame and a fixed target aperture, which
+results in a software-corrected fixed aperture lens.  This allows cheap photo
+zoom lenses to be reasonable as video lenses.
+
+The results aren't perfect because the lens aperture metadata is reported in
+steps, but the actual physical aperture of the lens smoothly varies.  I try to
+correct for this by building a table of the actual maximum aperture each focal
+length supports, but even that doesn't get me all the way there because it's
+not quite fine grained enough to look perfect.  As a result you'll get a little
+exposure variation during zooms, depending on how closely spaced the aperture
+and focal length steps are on your lens.
+
+Right now I'm just relying on a fixed list of known lenses for the focal length
+corrections, if your lens isn't in that list then check the "Force on Unknown
+Lenses" checkbox (or send a pull request with your lens info in there).  I
+might improve some of this ramping behavior at some point, depending on how
+much I use this.
+
+Resolve will run a lot faster if you plug numeric output of this into a
+BrightnessContrast filter's gain parameter, as opposed to using the image
+output of this filter.  The results should be the same, it's just a lot more
+computationally efficient.
+
+**Everything else in here, and all the code, was vibe coded.  So don't trust it
+too much.**
 
 Fusion fuses for dealing with variable-aperture lenses in DaVinci Resolve.
 
