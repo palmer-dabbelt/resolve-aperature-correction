@@ -268,6 +268,57 @@ do
 		out.gpu == nil and near(appliedGain(out), 0.765625), appliedGain(out))
 end
 
+tap.section("the gain is published as a number too")
+do
+	local tool = newTool()
+
+	local attrs = tool.outputAttrs.Gain
+	check("there is a Gain output", attrs ~= nil)
+	check("carrying a number", attrs and attrs.LINKID_DataType == "Number",
+		attrs and attrs.LINKID_DataType)
+	check("as a second output, not in place of the image",
+		attrs and attrs.LINK_Main == 2, attrs and attrs.LINK_Main)
+
+	tool:process(meta(), 1)
+	check("published on a correcting frame",
+		near(tool.out.Gain.Value, 0.765625), tool.out.Gain.Value)
+end
+
+do
+	-- A skipped frame still has to say something, or whatever is reading the
+	-- output keeps applying the last gain it saw to footage it does not suit.
+	local tool = newTool()
+	tool:process(meta({ lens_type = "Some Lens Nobody Has Measured" }), 1)
+	check("a passed-through frame publishes unity",
+		tool.out.Gain and tool.out.Gain.Value == 1.0, tool.out.Gain and tool.out.Gain.Value)
+end
+
+tap.section("Off: publish gain only")
+do
+	-- The point of this mode: hand the pixels to a native tool and touch none
+	-- of them here.
+	local tool = newTool()
+	tool:set("Processing", 3)
+	local _, out, img = tool:process(meta(), 1)
+
+	check("the image is passed through untouched", out == img)
+	check("no CPU copy", #out.gains == 0)
+	check("no channel op", out.channelOp == nil)
+	check("no GPU kernel", out.gpu == nil)
+	check("but the gain is still published",
+		near(tool.out.Gain.Value, 0.765625), tool.out.Gain.Value)
+	check("and no metadata stamp, which would need the copy",
+		out.Metadata.aperture_normalize == nil)
+end
+
+do
+	-- Reporting is independent of who applies the gain.
+	local tool = newTool()
+	tool:set("Processing", 3)
+	local report = tool:process(meta(), 1)
+	check("still reports the correction", contains(report, "0.7656"), report)
+end
+
 tap.section("metadata stamping")
 do
 	local tool = newTool()

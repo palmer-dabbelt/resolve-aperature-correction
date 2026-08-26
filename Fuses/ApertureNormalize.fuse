@@ -554,7 +554,12 @@ local function applyGainChannelOp(img, gain)
 	return img:ChannelOpOf("Multiply", nil, { R = gain, G = gain, B = gain })
 end
 
-local PROCESSING_GPU, PROCESSING_COPY, PROCESSING_CHANNELOP = 0, 1, 2
+-- PROCESSING_PUBLISH does no pixel work at all: the image passes through
+-- untouched and the gain is only published on the Gain output, for a native
+-- tool such as BrightnessContrast to apply. Every other mode touches all of
+-- the pixels from Lua, which on a 6K frame is several hundred megabytes of
+-- allocate-and-copy per frame however cheap the multiply itself is.
+local PROCESSING_GPU, PROCESSING_COPY, PROCESSING_CHANNELOP, PROCESSING_PUBLISH = 0, 1, 2, 3
 
 -- Once the GPU path has failed there is no reason to expect it to work on the
 -- next frame: the kernel either compiles on this machine or it does not.
@@ -594,6 +599,16 @@ function Create()
 		LINK_Main = 1,
 	})
 
+	-- A second output, carrying the same correction as a plain number, so the
+	-- multiply can be handed to a tool that does it on the GPU. Connect it to
+	-- BrightnessContrast's Gain. It is set on every frame, including the ones
+	-- this tool decides to skip, where it is 1.0 -- an output that went absent
+	-- would leave whatever consumed it holding a stale value.
+	OutGain = self:AddOutput("Gain", "Gain", {
+		LINKID_DataType = "Number",
+		LINK_Main = 2,
+	})
+
 	InTarget = self:AddInput("Target Aperture", "TargetAperture", {
 		LINKID_DataType = "Number",
 		INPID_InputControl = "SliderControl",
@@ -619,6 +634,7 @@ function Create()
 		{ CCS_AddString = "GPU (falls back to CPU)", },
 		{ CCS_AddString = "CPU: copy + gain", },
 		{ CCS_AddString = "CPU: channel op", },
+		{ CCS_AddString = "Off: publish gain only", },
 		CC_LabelPosition = "Vertical",
 	})
 
@@ -693,14 +709,20 @@ function Process(req)
 		end
 	end
 
-	if decision.skip then
+	local mode = InProcessing:GetValue(req).Value
+
+	OutGain:Set(req, Number(decision.gain or 1.0))
+
+	if decision.skip or mode == PROCESSING_PUBLISH then
 		-- Pass the original image straight through: no copy, no metadata
-		-- change, nothing for a downstream tool to notice.
+		-- change, nothing for a downstream tool to notice. In publish mode
+		-- that also means no metadata stamp, because writing one would need
+		-- the copy this mode exists to avoid.
 		OutImage:Set(req, img)
 		return
 	end
 
-	local out = applyGain(req, img, decision.gain, InProcessing:GetValue(req).Value)
+	local out = applyGain(req, img, decision.gain, mode)
 	stamp(out, decision)
 
 	OutImage:Set(req, out)

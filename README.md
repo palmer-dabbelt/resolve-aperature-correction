@@ -62,7 +62,7 @@ the values it came from.
 | --- | --- |
 | Target Aperture | The f-number to normalise to. Default 4. |
 | Force On Unknown Lenses | Correct lenses that aren't in the database. Off by default. |
-| Processing | *GPU (falls back to CPU)* by default, or either CPU path, to compare them. |
+| Processing | *GPU (falls back to CPU)* by default; either CPU path, to compare them; or *Off: publish gain only*, which touches no pixels and leaves the multiply to a downstream tool. |
 | Console Logging | Master switch for Console output. On by default. |
 | Report | *When It Changes* (default) or *Every Frame*. |
 | Report Folder | Where **Generate Report** writes. |
@@ -121,7 +121,7 @@ no GPU fuse support" from "the kernel would not compile" — and does not retry.
 The kernel either compiles on a given machine or it does not, and retrying per
 frame would cost a failed compile on top of the CPU work.
 
-**Processing** selects between three paths, so they can be compared on real
+**Processing** selects between four paths, so they can be compared on real
 footage rather than argued about:
 
 | Mode | What it does |
@@ -129,6 +129,33 @@ footage rather than argued about:
 | GPU | The DCTL kernel, falling back to *copy + gain* if it can't run. |
 | CPU: copy + gain | `CopyOf` then `Gain` in place. The documented pattern, two passes over the frame. |
 | CPU: channel op | One multiplying `ChannelOpOf`. One pass in principle, but through general channel-boolean machinery that may cost more than it saves. |
+| Off: publish gain only | Touches no pixels at all. The image is passed through by reference and the correction leaves only by the **Gain** output. |
+
+#### Letting a native tool do the multiply
+
+Every mode but the last one moves the whole frame through Lua. Even where the
+arithmetic is a single native call, a 6K RGBA float frame is a few hundred
+megabytes to allocate and copy, per frame — which is the cost worth suspecting
+first when playback is slow, since it does not depend on how simple the
+correction is.
+
+So the tool has a second output, **Gain**, carrying the correction as a plain
+number. Set Processing to *Off: publish gain only*, put a BrightnessContrast
+after it, and connect Gain to the BrightnessContrast's Gain input. The pixels
+are then handled by a native tool that has its own GPU path, and this fuse only
+reads metadata and does some arithmetic.
+
+Two things to know about that arrangement:
+
+- The **blue** input on BrightnessContrast is its Effect Mask — an image input
+  that limits *where* the correction applies. It is not a control input, and
+  connecting Gain to it will not work.
+- Nothing is stamped into the metadata in this mode. Writing a stamp needs the
+  image copy the mode exists to avoid.
+
+Gain is published on every frame, including passed-through ones, where it is
+1.0. An output that went absent would leave whatever consumed it holding a
+stale gain from some earlier frame.
 
 Beyond that:
 

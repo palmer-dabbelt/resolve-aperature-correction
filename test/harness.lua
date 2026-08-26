@@ -56,6 +56,8 @@ function harness.load(path)
 		registration = nil,
 		printed = {},
 		outputs = {},
+		out = {},
+		outputAttrs = {},
 
 		-- Whether the stubbed GPU is present, and whether its kernels run.
 		-- Both default on; a test flips them to exercise the fallbacks.
@@ -73,6 +75,12 @@ function harness.load(path)
 	env.TEX_ADDRESS_MODE_BORDER = "border"
 	env.TEX_NORMALIZED_COORDS_FALSE = false
 	env.TEX_NORMALIZED_COORDS_TRUE = true
+
+	-- Fusion wraps plain numbers in a Parameter before they travel down a
+	-- link; only .Value is ever read back, so that is all this carries.
+	function env.Number(v)
+		return { Value = v }
+	end
 
 	function env.Image(attrs)
 		local like = attrs and attrs.IMG_Like
@@ -179,8 +187,12 @@ function harness.load(path)
 
 		AddOutput = function(_, name, id, attrs)
 			local output = { Name = name, ID = id, Attrs = attrs }
-			function output:Set(req, img)
-				fuse.outputs[#fuse.outputs + 1] = img
+			fuse.outputAttrs[id] = attrs
+			function output:Set(req, value)
+				fuse.outputs[#fuse.outputs + 1] = value
+				-- Also by ID, because a tool with more than one output makes
+				-- "the last thing set" an unhelpful way to ask for one.
+				fuse.out[self.ID] = value
 			end
 			return output
 		end,
@@ -229,7 +241,7 @@ function harness.load(path)
 		if #self.printed > before then
 			report = self.printed[#self.printed]
 		end
-		return report, self.outputs[#self.outputs], img
+		return report, self.out.Output, img
 	end
 
 	-- Clicks a ButtonControl, by the input ID given to AddInput.
