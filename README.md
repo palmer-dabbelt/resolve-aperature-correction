@@ -53,31 +53,35 @@ lenses you know are fine, not about overriding arithmetic.
 
 #### What it normalises to
 
-By default, the widest aperture the lens has — f/3.5 for the 10-22mm, taken
-from the first half of its `aperture_range`. That is the one target every frame
-of a zoom can actually be brought to, because the ramp only ever runs from
-there towards darker, so every correction brightens and none of them throw
-light away. It also means a clip is matched to its own wide end rather than to
-an f-number picked in advance, and that two different lenses each get taken to
-their own best rather than to a common denominator neither is good at.
+Whatever **Target Aperture** says — and the tool fills that in for you. The
+first time a lens from the database turns up, the widest aperture that lens has
+is written into the slider: f/3.5 for the 10-22mm, taken from the first half of
+its `aperture_range`.
+
+That is the one target every frame of a zoom can actually be brought to,
+because the ramp only ever runs from there towards darker, so every correction
+brightens and none of them throw light away. It also means a clip is matched to
+its own wide end rather than to an f-number picked in advance.
 
 ```
-  aperture   : f4.5 -> target f3.5  (the widest this lens opens)
+  aperture   : f4.5 -> target f3.5
   correction : +0.725 stops (gain 1.6531)
   zoom       : 22mm
 ```
 
-The consequence to know about is that it only ever adds gain, so a long-end
-frame exposed to the top of the range will clip where it previously wouldn't
-have. If that matters, turn **Target The Lens's Widest Aperture** off and set
-**Target Aperture** to the narrow end instead — everything then darkens rather
-than brightens. Turning it off is also how to take several different lenses to
-one common f-number, which the per-lens default deliberately won't do.
+Type something else into the slider and it stays there. The tool only ever
+overwrites two things: the factory default, and a value it wrote itself. So a
+comp where the target was deliberately set to f/5.6 keeps f/5.6 however many
+lenses go past, while a timeline that changes lens re-fills rather than keeping
+the first lens's answer. A lens that isn't in the database has no widest to
+fill in from, so the slider keeps whatever it had — including under **Force On
+Unknown Lenses**, which supplies permission rather than data.
 
-A lens that isn't in the database has no widest to aim at, so those fall back
-to the slider even with the control on — including under **Force On Unknown
-Lenses**, which supplies permission rather than data. The report always says
-which of the two was used.
+The consequence to know about is that normalising to the widest only ever adds
+gain, so a long-end frame exposed to the top of the range will clip where it
+previously wouldn't have. If that matters, set **Target Aperture** to the
+narrow end instead — everything then darkens rather than brightens. That is
+also how to take several different lenses to one common f-number.
 
 When it *does* correct, it stamps
 `aperture_normalize.{gain,stops,from,target,lens,forced,focal,distance}` into
@@ -87,25 +91,62 @@ placed downstream shows the correction next to the values it came from.
 
 | Control | What it does |
 | --- | --- |
-| Target The Lens's Widest Aperture | Normalise to whatever the lens's widest is, ignoring the slider below. On by default. |
-| Target Aperture | The f-number to normalise to when that's off, or when the lens isn't in the database. Default 4. |
+| Target Aperture | The f-number to normalise to. Filled in with the lens's widest; ships at 4. |
 | Force On Unknown Lenses | Correct lenses that aren't in the database. Off by default. |
 | Processing | *GPU (falls back to CPU)* by default; either CPU path, to compare them; or *Off: publish gain only*, which touches no pixels and leaves the multiply to a downstream tool. |
-| Console Logging | Master switch for Console output. On by default. |
+| Console Logging | *None*, *Errors* (default), *Corrections*, or *All Metadata*. |
 | Report | *When It Changes* (default) or *Every Frame*. |
-| Report Folder | Where **Generate Report** writes. |
-| Generate Report | Dumps the current frame's full state to a file. |
 
-#### Generate Report
+#### Console Logging
 
-Pick a **Report Folder**, then press **Generate Report**. The next frame that
-renders writes `aperture-normalize-<clip>-<frame>.txt` there, containing the
-settings in force, what the tool decided and why, and a complete dump of the
-frame's metadata with nested fields flattened to dotted paths.
+Four settings, from silent to everything:
 
-It fires once per press rather than continuously, and it's most useful on a
-frame that *isn't* being corrected — the report says exactly which check
-rejected it. This is what replaced needing Aperture Probe in the comp.
+| Mode | What reaches the Console |
+| --- | --- |
+| None | Nothing at all. |
+| Errors | Only the frames it *declines* to correct, one line per distinct reason. The default. |
+| Corrections | Every correction, as the aperture and the zoom change. |
+| All Metadata | The above, plus every field the image carries. |
+
+**Errors** is the default because it is the one that's useful to leave on. A
+clip the tool understands produces no output whatsoever; a clip it won't touch
+says so once, with the reason. It's deduplicated by reason rather than by
+frame — an unlisted lens is one fact about the clip, so saying it again at
+every focal length would make the quiet mode the noisiest one.
+
+**All Metadata** is the mode for finding out what the camera actually tags, and
+for a specific reason. The zoom arrives in whole millimetres, so the correction
+is a staircase: every frame the camera calls 15mm gets an identical gain, and
+the real ramp inside that step goes uncorrected. What would fix it is a
+finer-grained number — a raw encoder count, a subdivided focal length — if the
+camera writes one. This is how to go looking.
+
+Which is why the fields that *moved* are marked rather than merely printed:
+
+```
+  metadata   : 7 field(s), 1 changed since frame 100
+     Filename         = /clips/A067.braw
+     GammaSpace.Gamma = 1
+     aperture         = f3.5
+     distance         = 2240mm to 6480mm
+     focal_length     = 15mm
+     lens_type        = Canon EF-S 10-22mm f/3.5-4.5 USM
+   * zoom_encoder     = 4837   (was 4821)
+```
+
+A field ticking while `focal_length` sits still is exactly what's being looked
+for, and finding it by eye across two screenfuls of identical values is the
+sort of thing people give up on halfway. `*` changed, `+` appeared, `-` went
+away, and nested fields are flattened to dotted paths.
+
+In this mode "has anything changed" widens to the whole of the metadata rather
+than just the parts the correction is computed from. It has to: a field that
+moves while the zoom and the aperture hold still would otherwise never trigger
+a report, and so would never be printed — which is precisely the field being
+hunted.
+
+Frames render on several threads and out of order, so the frame compared
+against is named in the header rather than assumed to be this one minus one.
 
 #### Zoom position
 
@@ -118,7 +159,7 @@ how much light reaches the sensor:
 ```
 -- Aperture Normalize [ApertureNormalize1] frame 5886 --
   lens       : Canon EF-S 10-22mm f/3.5-4.5 USM
-  aperture   : f4 -> target f3.5  (the widest this lens opens)
+  aperture   : f4 -> target f3.5
   correction : +0.385 stops (gain 1.3061)
   zoom       : 10mm  (focus 2240mm to 6480mm)
 ```
@@ -127,7 +168,8 @@ The zoom counts as a change, so a ramp reports at every distinct focal length
 rather than only where the reported f-number steps — which is what makes the
 output usable for deriving a correction curve. It is reported on frames that
 are *passed through* too, since those are part of the same curve. That is a lot
-more lines than before, hence **Console Logging** as a master switch.
+more lines than before, which is what *Errors* being the default setting of
+**Console Logging** is for.
 
 #### The lens lies about being wide open
 
@@ -146,7 +188,7 @@ reported aperture is wider than the lens can physically reach, the table wins.
 ```
 -- Aperture Normalize [ApertureNormalize1] frame 5931 --
   lens       : Canon EF-S 10-22mm f/3.5-4.5 USM
-  aperture   : f3.7 -> target f3.5  (the widest this lens opens)
+  aperture   : f3.7 -> target f3.5
   wide open  : f3.5 reported, but this lens only opens to f3.7 at 12mm
   correction : +0.160 stops (gain 1.1176)
   zoom       : 12mm  (focus 2240mm to 6480mm)
@@ -388,9 +430,11 @@ make uninstall       # remove whatever this repository installed
 ```
 
 `make install` deliberately installs only **Aperture Normalize**. The probe is
-a diagnostic rather than something to leave in a comp, and the normaliser can
-write its own report now. `make uninstall` still sweeps both, so it cleans up
-after an earlier `install-all`.
+a diagnostic rather than something to leave in a comp, and the normaliser's
+*All Metadata* logging covers most of what it was needed for in the first
+place. Reach for the probe when you want a whole clip captured to CSV rather
+than a Console you can scroll. `make uninstall` still sweeps both, so it cleans
+up after an earlier `install-all`.
 
 Fuses are loaded at startup, so **restart Resolve** afterwards. The tool then
 appears in the Fusion page's Effects Library under **Fuses → Metadata → Aperture

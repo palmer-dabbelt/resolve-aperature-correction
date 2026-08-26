@@ -21,18 +21,19 @@ darker than the metadata accounts for. So where the lens database knows how
 wide the lens actually opens at a given focal length, that -- not the reported
 f-number -- is what the correction is computed from.
 
-What it normalises *to* is, by default, the widest aperture the lens in the
-database has: every frame of a zoom can be brought up to that, since the ramp
-only ever runs from there towards darker, and a clip ends up matching its own
-wide end rather than some f-number picked in advance. Turn that off to aim
-several lenses at one common target instead.
+What it normalises *to* is the Target Aperture control, which the tool fills in
+for you: the first time a lens from the database turns up, the widest aperture
+that lens has is written into the slider. That is the one aperture every frame
+of a zoom can be brought to, since the ramp only ever runs from there towards
+darker. Type something else in and it stays -- the tool only ever overwrites
+the factory default or a value it put there itself.
 
 This tool is meant to be safe to leave enabled on every clip. Anything it does
 not positively understand is passed straight through, untouched and uncopied:
 footage with no metadata, a lens that isn't in the database below, an aperture
 it can't parse or that the lens couldn't have produced, or an image that isn't
-in linear light. It says which of those happened in the Console, and the
-Generate Report button writes the whole story to a file.
+in linear light. It says which of those happened in the Console, where setting
+Console Logging to All Metadata also dumps every field the image carries.
 --]]--
 
 FuRegisterClass("ApertureNormalize", CT_Tool, {
@@ -190,16 +191,28 @@ local function interpolate(tbl, x)
 	return nil
 end
 
+-- The database entry for whatever shot this frame, its lookup key, and whether
+-- the metadata named a lens at all -- which is a different thing from naming
+-- one we happen to know.
+local function lensFor(meta)
+	if type(meta) ~= "table" then return nil, nil, false end
+
+	local lensName = meta.lens_type
+	if lensName == nil or tostring(lensName) == "" then return nil, nil, false end
+
+	local key = lensKey(lensName)
+	return LENSES_BY_KEY[key], key, true
+end
+
 -- Decides what to do with a frame. Returns either { skip = "reason" } or a
 -- correction. Kept free of Fusion types so it can be tested without a host.
-local function plan(meta, target, force, auto)
+local function plan(meta, target, force)
 	if type(meta) ~= "table" then
 		return { skip = "the image carries no metadata" }
 	end
 
+	local entry, _, haveName = lensFor(meta)
 	local lensName = meta.lens_type
-	local haveName = lensName ~= nil and tostring(lensName) ~= ""
-	local entry = haveName and LENSES_BY_KEY[lensKey(lensName)] or nil
 
 	if not entry and not force then
 		if not haveName then
@@ -208,23 +221,10 @@ local function plan(meta, target, force, auto)
 		return { skip = 'lens "' .. tostring(lensName) .. '" is not in the lens database' }
 	end
 
-	-- What to normalise to. Left to itself the tool aims at the widest
-	-- aperture the lens has, which is the one aperture every frame of a zoom
-	-- can be brought to without inventing light the lens never gathered: the
-	-- ramp only ever runs from there towards darker. It also means a clip
-	-- matches its own wide end rather than an arbitrary f-number, and that two
-	-- lenses each get normalised to their own best rather than to a common
-	-- denominator neither of them is particularly good at.
-	--
-	-- An unlisted lens has no widest to aim at -- forcing supplies permission,
-	-- not a database entry -- so those fall back to the Target Aperture
-	-- control, and the report says which of the two was used.
-	local widestOfLens = entry and entry.lens.aperture_range and entry.lens.aperture_range[1]
-	local autoTarget = auto and widestOfLens ~= nil
-	if autoTarget then
-		target = widestOfLens
-	end
-
+	-- The target is simply whatever the Target Aperture control says. It gets
+	-- filled in with the widest aperture of whatever lens turns up (see
+	-- populateTarget below), so the useful default arrives without a second
+	-- control to explain, and changing it afterwards is just changing it.
 	if type(target) ~= "number" or target <= 0 then
 		return { skip = "the target aperture is not a usable f-number" }
 	end
@@ -293,7 +293,7 @@ local function plan(meta, target, force, auto)
 		aperture = aperture,
 		reported = reported,
 		target = target,
-		autoTarget = autoTarget,
+
 		stops = stops,
 		gain = 2 ^ stops,
 	}
@@ -337,9 +337,8 @@ local function buildReport(frame, decision)
 	else
 		out[#out + 1] = "  lens       : " .. decision.lens ..
 			(decision.forced and "  (forced, not in the lens database)" or "")
-		out[#out + 1] = string.format("  aperture   : f%s -> target f%s%s",
-			fnum(decision.aperture), fnum(decision.target),
-			decision.autoTarget and "  (the widest this lens opens)" or "")
+		out[#out + 1] = string.format("  aperture   : f%s -> target f%s",
+			fnum(decision.aperture), fnum(decision.target))
 		local wide = wideOpenLine(decision)
 		if wide then out[#out + 1] = wide end
 		out[#out + 1] = string.format("  correction : %+.3f stops (gain %.4f)",
@@ -360,8 +359,8 @@ local function signature(decision)
 	if decision.skip then
 		return "skip:" .. decision.skip .. "|" .. zoom
 	end
-	return string.format("%s|%s|%s|%s|%s|%s|%s", decision.lens, tostring(decision.aperture),
-		tostring(decision.reported), tostring(decision.target), tostring(decision.autoTarget),
+	return string.format("%s|%s|%s|%s|%s|%s", decision.lens, tostring(decision.aperture),
+		tostring(decision.reported), tostring(decision.target),
 		tostring(decision.forced), zoom)
 end
 
@@ -380,7 +379,7 @@ end
 
 local cached = nil
 
-local function decide(meta, target, force, auto)
+local function decide(meta, target, force)
 	local isTable = type(meta) == "table"
 	local lensRaw = isTable and meta.lens_type or nil
 	local apertureRaw = isTable and meta.aperture or nil
@@ -394,11 +393,11 @@ local function decide(meta, target, force, auto)
 	local c = cached
 	if c and c.isTable == isTable and c.lens == lensRaw and c.aperture == apertureRaw
 		and c.gamma == gammaRaw and c.target == target and c.force == force
-		and c.auto == auto and c.focal == focalRaw and c.distance == distanceRaw then
+		and c.focal == focalRaw and c.distance == distanceRaw then
 		return c.decision
 	end
 
-	local decision = plan(meta, target, force, auto)
+	local decision = plan(meta, target, force)
 	decision.focal = focalRaw
 	decision.focalMm = parseFocal(focalRaw)
 	decision.distance = distanceRaw
@@ -430,7 +429,7 @@ local function decide(meta, target, force, auto)
 		gamma = gammaRaw,
 		target = target,
 		force = force,
-		auto = auto,
+
 		decision = decision,
 	}
 
@@ -452,33 +451,51 @@ local function stamp(img, decision)
 end
 
 -- ---------------------------------------------------------------------------
--- Generate Report
+-- Logging every field
 -- ---------------------------------------------------------------------------
+--
+-- Console Logging set to All Metadata appends everything the image carries to
+-- each report. The reason to want that is usually that the correction is not
+-- tracking the shot: the zoom arrives as whole millimetres, so a slow zoom
+-- gets a staircase of gains with the real ramp still sitting inside each step,
+-- and what would fix it is some finer-grained number further down the list.
+-- Whether the camera tags one is not something this end can know, so the
+-- answer is to show the lot and let a human read it.
+--
+-- Which is why the fields that moved are marked rather than merely printed. A
+-- field that ticks while focal_length holds still is exactly what is being
+-- looked for, and finding it by eye across two screenfuls of identical values
+-- is the sort of thing people give up on halfway.
+
+-- Errors is the default, and it is the quiet one: a clip the tool understands
+-- produces no Console output at all, and the frames it declines to correct
+-- produce one line each -- per distinct reason, not per frame, and not per
+-- zoom position either. Left on a timeline that is the useful signal, since
+-- the thing worth knowing is "this clip isn't being corrected, and here is
+-- why" rather than a running commentary on the clips that are fine.
+local LOG_NONE, LOG_ERRORS, LOG_CORRECTIONS, LOG_ALL = 0, 1, 2, 3
 
 -- Walks nested metadata into dotted paths, guarding against cycles and runaway
--- nesting because this is data we did not create.
+-- nesting because this is data we did not create. Returns a map of path to
+-- printable value rather than a list of lines, because the metadata log wants
+-- to compare two of these against each other rather than just print one.
 local function flatten(tbl, prefix, out, seen, depth)
 	if depth > MAX_DEPTH then
-		out[#out + 1] = prefix .. "* = <nested deeper than " .. MAX_DEPTH .. " levels>"
+		out[prefix .. "*"] = "<nested deeper than " .. MAX_DEPTH .. " levels>"
 		return out
 	end
 
 	seen[tbl] = true
 
-	local keys = {}
-	for k in pairs(tbl) do keys[#keys + 1] = k end
-	table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-
-	for _, k in ipairs(keys) do
-		local v = tbl[k]
+	for k, v in pairs(tbl) do
 		local path = prefix .. tostring(k)
 
 		if type(v) ~= "table" then
-			out[#out + 1] = path .. " = " .. tostring(v)
+			out[path] = tostring(v)
 		elseif seen[v] then
-			out[#out + 1] = path .. " = <circular reference>"
+			out[path] = "<circular reference>"
 		elseif next(v) == nil then
-			out[#out + 1] = path .. " = <empty table>"
+			out[path] = "<empty table>"
 		else
 			flatten(v, path .. ".", out, seen, depth + 1)
 		end
@@ -488,88 +505,94 @@ local function flatten(tbl, prefix, out, seen, depth)
 	return out
 end
 
-local function clipName(meta)
-	if type(meta) == "table" and meta.Filename then
-		local base = tostring(meta.Filename):match("([^/\\]+)$")
-		if base then
-			base = base:gsub("%.[^.]+$", "")
-			base = base:gsub("[^%w%-_.]", "_")
-			if base ~= "" then return base end
-		end
-	end
-	return "clip"
+-- Dotted paths in a stable order. pairs() is not one, and a dump whose lines
+-- move around between frames is useless for spotting what changed.
+local function sortedPaths(fields)
+	local paths = {}
+	for path in pairs(fields) do paths[#paths + 1] = path end
+	table.sort(paths)
+	return paths
 end
 
-local function timestamp()
-	local ok, stamped = pcall(os.date, "%Y-%m-%d %H:%M:%S")
-	if ok and stamped then return tostring(stamped) end
-	return "unknown"
+-- A value shortened enough to sit on one line. Some cameras write long strings
+-- and one runaway field should not push the rest of the dump off the screen.
+local MAX_VALUE = 200
+
+local function short(v)
+	v = tostring(v)
+	if #v > MAX_VALUE then
+		return v:sub(1, MAX_VALUE) .. "... (" .. #v .. " characters)"
+	end
+	return v
 end
 
-local function writeReport(dir, frame, meta, decision, target, force, auto)
-	local path = string.format("%s/aperture-normalize-%s-%s.txt", dir, clipName(meta), tostring(frame))
+-- Everything the image carries, one field per line, with anything that moved
+-- since the previously logged frame marked: "*" changed, "+" appeared, "-"
+-- went away. `previous` is nil on the first frame, when there is nothing to
+-- compare against and nothing is marked.
+--
+-- Fusion renders frames on several threads and out of order, so the frame that
+-- was logged last is not reliably this one minus one. It is named in the header
+-- rather than assumed, which keeps the output honest when it isn't.
+local function metadataBlock(fields, previous, previousFrame)
+	local paths = sortedPaths(fields)
 
-	local out = {}
-	out[#out + 1] = "Aperture Normalize report"
-	out[#out + 1] = "generated : " .. timestamp()
-	out[#out + 1] = "tool      : " .. toolName()
-	out[#out + 1] = "frame     : " .. tostring(frame)
-	out[#out + 1] = ""
-	out[#out + 1] = "settings"
-	out[#out + 1] = "  target the lens's widest: " .. (auto and "yes" or "no")
-	out[#out + 1] = "  target aperture         : f" .. fnum(target) ..
-		(decision.autoTarget and "  (unused: the lens's own widest was targeted instead)" or "")
-	out[#out + 1] = "  force on unknown lenses : " .. (force and "yes" or "no")
-	out[#out + 1] = ""
-	out[#out + 1] = "outcome"
-	if decision.skip then
-		out[#out + 1] = "  passed through, because " .. decision.skip
-	else
-		out[#out + 1] = "  lens       : " .. decision.lens ..
-			(decision.forced and "  (forced, not in the lens database)" or "")
-		out[#out + 1] = string.format("  aperture   : f%s -> target f%s%s",
-			fnum(decision.aperture), fnum(decision.target),
-			decision.autoTarget and "  (the widest this lens opens)" or "")
-		local wide = wideOpenLine(decision)
-		if wide then out[#out + 1] = wide end
-		out[#out + 1] = string.format("  correction : %+.4f stops (gain %.6f)",
-			decision.stops, decision.gain)
-	end
-	if decision.focal then
-		out[#out + 1] = "  zoom       : " .. tostring(decision.focal) ..
-			(decision.distance and ("  (focus " .. tostring(decision.distance) .. ")") or "")
-	end
-	out[#out + 1] = ""
-	out[#out + 1] = "metadata"
-
-	if type(meta) == "table" then
-		local fields = flatten(meta, "", {}, {}, 1)
-		if #fields == 0 then
-			out[#out + 1] = "  (present but empty)"
-		else
-			for _, line in ipairs(fields) do
-				out[#out + 1] = "  " .. line
+	local marks, changed = {}, 0
+	if previous then
+		for _, path in ipairs(paths) do
+			if previous[path] == nil then
+				marks[path], changed = "+", changed + 1
+			elseif previous[path] ~= fields[path] then
+				marks[path], changed = "*", changed + 1
 			end
 		end
-	else
-		out[#out + 1] = "  (none: Image.Metadata is nil)"
+		-- Fields that were there last time and are not now. They sort in
+		-- among the rest rather than trailing off the end, so a field that
+		-- flickers in and out stays next to its neighbours.
+		for path in pairs(previous) do
+			if fields[path] == nil then
+				paths[#paths + 1] = path
+				marks[path], changed = "-", changed + 1
+			end
+		end
+		table.sort(paths)
 	end
 
-	-- Lua has no mkdir, and a missing directory is the likeliest reason this
-	-- fails, so take one shot at creating it before giving up.
-	pcall(function() os.execute('mkdir -p "' .. dir .. '"') end)
-
-	local f, err = io.open(path, "w")
-	if not f then
-		print("-- Aperture Normalize: cannot write " .. path .. "\n   " .. tostring(err) ..
-		      "\n   A sandboxed Resolve may be refused paths outside its container.")
-		return
+	local out = {}
+	if #paths == 0 then
+		out[#out + 1] = "  metadata   : present but empty"
+		return out
 	end
-	f:write(table.concat(out, "\n") .. "\n")
-	f:close()
 
-	print("-- Aperture Normalize: wrote " .. path)
+	local header = string.format("  metadata   : %d field(s)", #paths)
+	if previous then
+		header = header .. string.format(", %d changed since frame %s",
+			changed, tostring(previousFrame))
+	end
+	out[#out + 1] = header
+
+	local width = 0
+	for _, path in ipairs(paths) do
+		if #path > width then width = #path end
+	end
+
+	for _, path in ipairs(paths) do
+		local mark = marks[path] or " "
+		if mark == "-" then
+			out[#out + 1] = string.format("   %s %-" .. width .. "s   (gone; was %s)",
+				mark, path, short(previous[path]))
+		elseif mark == "*" then
+			out[#out + 1] = string.format("   %s %-" .. width .. "s = %s   (was %s)",
+				mark, path, short(fields[path]), short(previous[path]))
+		else
+			out[#out + 1] = string.format("   %s %-" .. width .. "s = %s",
+				mark, path, short(fields[path]))
+		end
+	end
+
+	return out
 end
+
 
 -- ---------------------------------------------------------------------------
 -- Applying the gain
@@ -682,7 +705,7 @@ local PROCESSING_GPU, PROCESSING_COPY, PROCESSING_CHANNELOP, PROCESSING_PUBLISH 
 -- is worse than never having tried.
 local gpuUnavailable = false
 
-local function applyGain(req, img, gain, mode)
+local function applyGain(req, img, gain, mode, logging)
 	if mode == PROCESSING_GPU and not gpuUnavailable then
 		-- pcall because a host missing the DCTL entry points entirely would
 		-- raise rather than simply return nothing.
@@ -690,8 +713,12 @@ local function applyGain(req, img, gain, mode)
 		if ok and out then return out end
 
 		gpuUnavailable = true
-		print("-- Aperture Normalize: GPU path unavailable, using the CPU from here on\n   " ..
-			(ok and tostring(reason or "no reason given") or ("it raised: " .. tostring(out))))
+		-- An issue rather than a running commentary, so it survives into
+		-- Errors mode -- but None means none.
+		if logging == nil or logging > LOG_NONE then
+			print("-- Aperture Normalize: GPU path unavailable, using the CPU from here on\n   " ..
+				(ok and tostring(reason or "no reason given") or ("it raised: " .. tostring(out))))
+		end
 	end
 
 	if mode == PROCESSING_CHANNELOP then
@@ -700,8 +727,67 @@ local function applyGain(req, img, gain, mode)
 	return applyGainCopy(img, gain)
 end
 
-local lastSignature = nil
-local reportPending = false
+local lastLogged = nil
+
+-- Reasons already said out loud in Errors mode. A duplicate print from two
+-- render threads racing here would be harmless, which is why this is a plain
+-- set rather than the replaced-wholesale tables used where a torn read would
+-- actually pair up the wrong values.
+local reported = {}
+
+-- ---------------------------------------------------------------------------
+-- Filling in the target
+-- ---------------------------------------------------------------------------
+--
+-- The widest aperture the lens has is the target that is right for a clip shot
+-- with it: it is the one aperture every frame of a zoom can be brought to,
+-- since the ramp only ever runs from there towards darker. So rather than ask
+-- for it, the tool writes it into the Target Aperture control the first time a
+-- lens it knows turns up, and then leaves it alone. What is on the slider is
+-- the target -- there is no second control saying whether to believe it.
+--
+-- The hazard in a tool that writes to its own controls is stamping on a value
+-- somebody chose. So it only overwrites two things: the factory default, and a
+-- value it put there itself. Open a comp where the target was deliberately set
+-- to f/5.6 and it stays f/5.6, however many lenses go past.
+
+local TARGET_DEFAULT = 4.0
+
+-- The lens we have already filled the target in for, and what we filled it
+-- with. One table, replaced wholesale, because Process runs on several
+-- threads.
+local populated = nil
+
+local function sameNumber(a, b)
+	return type(a) == "number" and type(b) == "number" and math.abs(a - b) < 1e-9
+end
+
+-- Returns the target to use for this frame, having possibly written it to the
+-- control first.
+local function populateTarget(input, meta, target, time)
+	local entry, key = lensFor(meta)
+	local widest = entry and entry.lens.aperture_range and entry.lens.aperture_range[1]
+	if not widest then return target end
+
+	local state = populated
+	if state and state.key == key then return target end
+
+	if not (sameNumber(target, TARGET_DEFAULT) or (state and sameNumber(target, state.value))) then
+		-- Somebody set this deliberately. Remember the lens anyway, so the
+		-- question is not asked again for every frame of the clip.
+		populated = { key = key, value = state and state.value }
+		return target
+	end
+
+	populated = { key = key, value = widest }
+
+	-- A host that will not let a tool write its own input is not a reason to
+	-- stop correcting; the slider simply keeps whatever it had.
+	local ok = pcall(function() input:SetSource(Number(widest), time or 0) end)
+	if not ok then return target end
+
+	return widest
+end
 
 function Create()
 	InImage = self:AddInput("Input", "Input", {
@@ -724,21 +810,10 @@ function Create()
 		LINK_Main = 2,
 	})
 
-	-- On by default, because the widest aperture the lens has is the one
-	-- target that is right for any clip shot with it, and it is what the
-	-- Target Aperture slider would otherwise have to be set to by hand per
-	-- lens. Turn it off to normalise several lenses to a common f-number.
-	InAutoTarget = self:AddInput("Target The Lens's Widest Aperture", "AutoTarget", {
-		LINKID_DataType = "Number",
-		INPID_InputControl = "CheckboxControl",
-		INP_Integer = true,
-		INP_Default = 1.0,
-	})
-
 	InTarget = self:AddInput("Target Aperture", "TargetAperture", {
 		LINKID_DataType = "Number",
 		INPID_InputControl = "SliderControl",
-		INP_Default = 4.0,
+		INP_Default = TARGET_DEFAULT,
 		INP_MinScale = 1.0,
 		INP_MaxScale = 22.0,
 		INP_MinAllowed = 0.5,
@@ -764,11 +839,20 @@ function Create()
 		CC_LabelPosition = "Vertical",
 	})
 
+	-- This was a checkbox. Its 0 still means None, so a comp that had logging
+	-- switched off still has it switched off; its 1 now lands on Errors rather
+	-- than the old always-on behaviour, which is a quieter place to be than
+	-- where such a comp was left.
 	InConsole = self:AddInput("Console Logging", "ConsoleLogging", {
 		LINKID_DataType = "Number",
-		INPID_InputControl = "CheckboxControl",
+		INPID_InputControl = "ComboControl",
+		INP_Default = LOG_ERRORS,
 		INP_Integer = true,
-		INP_Default = 1.0,
+		{ CCS_AddString = "None", },
+		{ CCS_AddString = "Errors", },
+		{ CCS_AddString = "Corrections", },
+		{ CCS_AddString = "All Metadata", },
+		CC_LabelPosition = "Vertical",
 	})
 
 	InWhen = self:AddInput("Report", "Report", {
@@ -781,58 +865,68 @@ function Create()
 		CC_LabelPosition = "Vertical",
 	})
 
-	InReportDir = self:AddInput("Report Folder", "ReportDir", {
-		LINKID_DataType = "Text",
-		INPID_InputControl = "FileControl",
-		INPS_DefaultText = "",
-		FC_PathBrowse = true,
-		FC_IsSaver = true,
-	})
-
-	InGenerate = self:AddInput("Generate Report", "GenerateReport", {
-		LINKID_DataType = "Text",
-		INPID_InputControl = "ButtonControl",
-		INP_DoNotifyChanged = true,
-		INP_External = false,
-	})
-end
-
-function NotifyChanged(inp, param, time)
-	if inp == InGenerate then
-		-- NotifyChanged has no image to look at, so leave a note for the
-		-- render that the button click is about to trigger.
-		reportPending = true
-	end
 end
 
 function Process(req)
 	local img = InImage:GetValue(req)
 	local meta = img.Metadata
+	local frame = req:GetTime()
 
-	local target = InTarget:GetValue(req).Value
+	local target = populateTarget(InTarget, meta, InTarget:GetValue(req).Value, frame)
 	local force = InForce:GetValue(req).Value > 0.5
-	local auto = InAutoTarget:GetValue(req).Value > 0.5
 
-	local decision = decide(meta, target, force, auto)
+	local decision = decide(meta, target, force)
 
-	-- Tracking the zoom means a ramp reports at every distinct focal length
-	-- rather than only where the aperture steps, which is a lot more lines --
-	-- hence the master switch.
-	if InConsole:GetValue(req).Value > 0.5 then
-		local everyFrame = InWhen:GetValue(req).Value > 0.5
-		if everyFrame or decision.sig ~= lastSignature then
-			lastSignature = decision.sig
-			print(buildReport(req:GetTime(), decision))
+	local logging = InConsole:GetValue(req).Value
+
+	if logging == LOG_ERRORS then
+		-- Keyed on the reason alone -- not on the zoom, the way the fuller
+		-- modes are. A lens that isn't in the database is one fact about the
+		-- clip, and saying it again at every focal length would turn the one
+		-- mode that is meant to stay quiet into the noisiest of them.
+		if decision.skip and not reported[decision.skip] then
+			reported[decision.skip] = true
+			print(buildReport(frame, decision))
 		end
-	end
+	elseif logging >= LOG_CORRECTIONS then
+		-- Tracking the zoom means a ramp reports at every distinct focal
+		-- length rather than only where the aperture steps, which is a lot
+		-- more lines -- hence None being one of the choices.
+		--
+		-- In All Metadata the question of what counts as a change has to widen
+		-- to the whole of the metadata, not just the parts the correction is
+		-- computed from. Narrowing it would hide precisely the field this mode
+		-- exists to find: one that moves while the zoom and the aperture sit
+		-- still would never trigger a report, and so would never be printed.
+		local fields = nil
+		local sig = decision.sig
+		if logging >= LOG_ALL and type(meta) == "table" then
+			fields = flatten(meta, "", {}, {}, 1)
+			local paths = sortedPaths(fields)
+			local parts = { sig }
+			for _, path in ipairs(paths) do
+				parts[#parts + 1] = path .. "=" .. fields[path]
+			end
+			sig = table.concat(parts, "|")
+		end
 
-	if reportPending then
-		reportPending = false
-		local dir = InReportDir:GetValue(req).Value or ""
-		if dir == "" then
-			print("-- Aperture Normalize: set a Report Folder first")
-		else
-			writeReport(dir, req:GetTime(), meta, decision, target, force, auto)
+		local previous = lastLogged
+		local everyFrame = InWhen:GetValue(req).Value > 0.5
+		if everyFrame or not previous or previous.sig ~= sig then
+			lastLogged = { sig = sig, fields = fields, frame = frame }
+
+			local out = { buildReport(frame, decision) }
+			if logging >= LOG_ALL then
+				if fields then
+					local block = metadataBlock(fields,
+						previous and previous.fields or nil,
+						previous and previous.frame or nil)
+					for _, line in ipairs(block) do out[#out + 1] = line end
+				else
+					out[#out + 1] = "  metadata   : none (Image.Metadata is nil)"
+				end
+			end
+			print(table.concat(out, "\n"))
 		end
 	end
 
@@ -849,7 +943,7 @@ function Process(req)
 		return
 	end
 
-	local out = applyGain(req, img, decision.gain, mode)
+	local out = applyGain(req, img, decision.gain, mode, logging)
 	stamp(out, decision)
 
 	OutImage:Set(req, out)

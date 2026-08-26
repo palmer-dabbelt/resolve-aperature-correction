@@ -175,6 +175,18 @@ function harness.load(path)
 			for k, v in pairs(t) do self.Attrs[k] = v end
 		end
 
+		-- A tool writing to its own control. Records the writes as well as
+		-- applying them, so a test can tell "left alone" apart from "set to
+		-- the value it already had".
+		input.sourced = {}
+
+		function input:SetSource(param, time)
+			local v = param
+			if type(param) == "table" then v = param.Value end
+			self.value = v
+			self.sourced[#self.sourced + 1] = v
+		end
+
 		return input
 	end
 

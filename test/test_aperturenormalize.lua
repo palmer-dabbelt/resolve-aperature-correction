@@ -14,17 +14,26 @@ local check, contains, near = tap.check, tap.contains, tap.near
 
 local LENS = "Canon EF-S 10-22mm f/3.5-4.5 USM"
 
--- Most of what follows is about the arithmetic, and reads much better against
--- a target that stays put, so these pin it to f/4 -- what the slider ships set
--- to -- rather than letting it follow the lens. The shipped default is that it
--- does follow the lens; newDefaultTool() is the untouched tool, and the
--- "normalising to the lens's widest" section below is where that is tested.
-local function newTool()
+-- The tool fills the Target Aperture control in with the lens's widest the
+-- first time it sees a lens it knows -- but only over the factory default or a
+-- value it wrote itself. So a test that pins the target to anything else keeps
+-- it, which is what most of what follows wants: arithmetic reads better
+-- against a target that stays put. f/3.5 taken to f/5.6 is exactly 0.390625.
+local TEST_TARGET = 5.6
+local TEST_GAIN = (3.5 / 5.6) ^ 2
+
+-- Console Logging ships on Errors, which says nothing at all about a frame it
+-- corrected. Most of what follows wants to read the report, so it asks for
+-- Corrections -- the mode that used to be the only one there was.
+local function newTool(target)
 	local tool = harness.load(FUSE)
-	tool:set("AutoTarget", 0)
+	tool:set("TargetAperture", target or TEST_TARGET)
+	tool:set("ConsoleLogging", 2)
 	return tool
 end
 
+-- The tool as it ships, target still at the factory default and so still up
+-- for grabs. The "filling in the target" section is where that is tested.
 local function newDefaultTool()
 	return harness.load(FUSE)
 end
@@ -76,29 +85,29 @@ end
 
 tap.section("the correction itself")
 do
-	-- f/3.5 normalised to f/4 is (3.5/4)^2 = 0.765625, i.e. it darkens.
+	-- f/3.5 normalised to f/5.6 is (3.5/5.6)^2 = 0.390625, i.e. it darkens.
 	local tool = newTool()
 	local report, out, img = tool:process(meta(), 1)
 
 	check("output is a new image", out ~= img)
-	check("gain is (3.5/4)^2", near(appliedGain(out), 0.765625), appliedGain(out))
-	check("reports the stops", contains(report, "-0.385 stops"), report)
+	check("gain is (3.5/5.6)^2", near(appliedGain(out), TEST_GAIN), appliedGain(out))
+	check("reports the stops", contains(report, "-1.356 stops"), report)
 	check("names the lens", contains(report, LENS), report)
 end
 
 do
-	-- f/4.5 is dimmer than f/4, so normalising brightens.
+	-- f/4.5 is nearer f/5.6 than f/3.5 is, so it darkens less.
 	local tool = newTool()
 	local _, out = tool:process(meta({ aperture = "f4.5" }), 1)
-	check("f/4.5 brightens", near(appliedGain(out), (4.5 / 4) ^ 2), appliedGain(out))
+	check("f/4.5 darkens less", near(appliedGain(out), (4.5 / TEST_TARGET) ^ 2), appliedGain(out))
 end
 
 tap.section("target aperture")
 do
 	local tool = newTool()
-	tool:set("TargetAperture", 5.6)
+	tool:set("TargetAperture", 8)
 	local _, out = tool:process(meta(), 1)
-	check("honours a different target", near(appliedGain(out), (3.5 / 5.6) ^ 2), appliedGain(out))
+	check("honours a different target", near(appliedGain(out), (3.5 / 8) ^ 2), appliedGain(out))
 end
 
 do
@@ -112,7 +121,7 @@ do
 	for _, written in ipairs({ "f3.5", "F3.5", "F/3.5", "3.5", "f 3.5" }) do
 		local tool = newTool()
 		local _, out = tool:process(meta({ aperture = written }), 1)
-		check('reads "' .. written .. '"', near(appliedGain(out), 0.765625), appliedGain(out))
+		check('reads "' .. written .. '"', near(appliedGain(out), TEST_GAIN), appliedGain(out))
 	end
 end
 
@@ -152,7 +161,7 @@ do
 	-- between two that don't, so reporting it as a pass-through made the tool
 	-- look like it had stopped working halfway through the shot.
 	local tool = newTool()
-	local report, out, img = tool:process(meta({ aperture = "f4" }), 1)
+	local report, out, img = tool:process(meta({ aperture = "f5.6" }), 1)
 
 	check("a frame already at the target is not passed through", out ~= img)
 	check("its gain is unity", near(appliedGain(out), 1.0), appliedGain(out))
@@ -167,7 +176,7 @@ do
 	local tool = newTool()
 	tool:set("Force", 1)
 	local report, out = tool:process(meta({ lens_type = "Sigma 18-35mm f/1.8 DC HSM" }), 1)
-	check("corrects an unlisted lens", near(appliedGain(out), 0.765625), appliedGain(out))
+	check("corrects an unlisted lens", near(appliedGain(out), TEST_GAIN), appliedGain(out))
 	check("says the correction was forced", contains(report, "forced"), report)
 	check("still names the lens", contains(report, "Sigma 18-35mm f/1.8 DC HSM"), report)
 end
@@ -176,7 +185,7 @@ do
 	local tool = newTool()
 	tool:set("Force", 1)
 	local report, out = tool:process(meta({ lens_type = "<nil>" }), 1)
-	check("covers metadata with no lens at all", near(appliedGain(out), 0.765625), appliedGain(out))
+	check("covers metadata with no lens at all", near(appliedGain(out), TEST_GAIN), appliedGain(out))
 	check("calls it unidentified", contains(report, "unidentified lens"), report)
 end
 
@@ -223,7 +232,7 @@ do
 	check("used the GPU", out.gpu ~= nil)
 	check("ran the aperture kernel", out.gpu and out.gpu.kernel == "ApertureGainKernel",
 		out.gpu and out.gpu.kernel)
-	check("handed the kernel the gain", near(out.gpu.gain, 0.765625), out.gpu.gain)
+	check("handed the kernel the gain", near(out.gpu.gain, TEST_GAIN), out.gpu.gain)
 	check("read the source image", out.gpu.inputs.src == img)
 	check("sampled point-wise in pixel coordinates",
 		out.gpu.sampler.filter == "point" and out.gpu.sampler.norm == false,
@@ -238,7 +247,7 @@ do
 	local _, out = tool:process(meta(), 1)
 
 	check("copy+gain leaves the GPU alone", out.gpu == nil)
-	check("copy+gain applies the same gain", near(appliedGain(out), 0.765625), appliedGain(out))
+	check("copy+gain applies the same gain", near(appliedGain(out), TEST_GAIN), appliedGain(out))
 	check("copy+gain leaves alpha at unity", out.gains[1].a == 1.0, out.gains[1].a)
 end
 
@@ -252,7 +261,7 @@ do
 	check("channel op multiplies", out.channelOp and out.channelOp.operation == "Multiply",
 		out.channelOp and out.channelOp.operation)
 	check("channel op applies the same gain",
-		near(out.channelOp.options.R, 0.765625), out.channelOp.options.R)
+		near(out.channelOp.options.R, TEST_GAIN), out.channelOp.options.R)
 	check("channel op leaves alpha out entirely", out.channelOp.options.A == nil)
 end
 
@@ -262,7 +271,7 @@ do
 	tool.gpuAvailable = false
 	local report, out = tool:process(meta(), 1)
 
-	check("falls back to the CPU", out.gpu == nil and near(appliedGain(out), 0.765625), appliedGain(out))
+	check("falls back to the CPU", out.gpu == nil and near(appliedGain(out), TEST_GAIN), appliedGain(out))
 	check("says so once", contains(tool.printed[#tool.printed], "GPU path unavailable"),
 		tool.printed[#tool.printed])
 	check("and says which step failed",
@@ -288,7 +297,7 @@ do
 	tool.gpuRuns = false
 	local _, out = tool:process(meta(), 1)
 	check("a failed kernel falls back too",
-		out.gpu == nil and near(appliedGain(out), 0.765625), appliedGain(out))
+		out.gpu == nil and near(appliedGain(out), TEST_GAIN), appliedGain(out))
 end
 
 tap.section("the gain is published as a number too")
@@ -304,7 +313,7 @@ do
 
 	tool:process(meta(), 1)
 	check("published on a correcting frame",
-		near(tool.out.Gain.Value, 0.765625), tool.out.Gain.Value)
+		near(tool.out.Gain.Value, TEST_GAIN), tool.out.Gain.Value)
 end
 
 do
@@ -329,7 +338,7 @@ do
 	check("no channel op", out.channelOp == nil)
 	check("no GPU kernel", out.gpu == nil)
 	check("but the gain is still published",
-		near(tool.out.Gain.Value, 0.765625), tool.out.Gain.Value)
+		near(tool.out.Gain.Value, TEST_GAIN), tool.out.Gain.Value)
 	check("and no metadata stamp, which would need the copy",
 		out.Metadata.aperture_normalize == nil)
 end
@@ -339,7 +348,7 @@ do
 	local tool = newTool()
 	tool:set("Processing", 3)
 	local report = tool:process(meta(), 1)
-	check("still reports the correction", contains(report, "0.7656"), report)
+	check("still reports the correction", contains(report, "0.3906"), report)
 end
 
 tap.section("metadata stamping")
@@ -350,9 +359,9 @@ do
 
 	local stamped = out.Metadata.aperture_normalize
 	check("stamps the output", type(stamped) == "table")
-	check("records the gain", stamped and near(tonumber(stamped.gain), 0.765625), stamped and stamped.gain)
+	check("records the gain", stamped and near(tonumber(stamped.gain), TEST_GAIN), stamped and stamped.gain)
 	check("records the source aperture", stamped and stamped.from == "f3.5", stamped and stamped.from)
-	check("records the target", stamped and stamped.target == "f4", stamped and stamped.target)
+	check("records the target", stamped and stamped.target == "f5.6", stamped and stamped.target)
 	check("records the lens", stamped and stamped.lens == LENS)
 	check("records that it was not forced", stamped and stamped.forced == "0", stamped and stamped.forced)
 	check("records the zoom position", stamped and stamped.focal == "10mm", stamped and stamped.focal)
@@ -369,11 +378,11 @@ do
 	local tool = newTool()
 	local first = tool:process(meta(), 1)
 	local _, out = tool:process(meta({ aperture = "f3.5" }), 2)
-	check("same inputs still correct on later frames", near(appliedGain(out), 0.765625), appliedGain(out))
+	check("same inputs still correct on later frames", near(appliedGain(out), TEST_GAIN), appliedGain(out))
 
 	-- Changing an input the decision depends on must invalidate the cache.
 	local _, out2 = tool:process(meta({ aperture = "f4.5" }), 3)
-	check("a new aperture is noticed", near(appliedGain(out2), (4.5 / 4) ^ 2), appliedGain(out2))
+	check("a new aperture is noticed", near(appliedGain(out2), (4.5 / TEST_TARGET) ^ 2), appliedGain(out2))
 
 	tool:set("TargetAperture", 5.6)
 	local _, out3 = tool:process(meta({ aperture = "f4.5" }), 4)
@@ -456,10 +465,10 @@ do
 	local report, out = tool:process(meta({ focal_length = "12mm" }), 1)
 
 	check("corrects from what the lens can actually do",
-		near(appliedGain(out), (3.7 / 4) ^ 2), appliedGain(out))
+		near(appliedGain(out), (3.7 / TEST_TARGET) ^ 2), appliedGain(out))
 	check("not from the f-number the camera reported",
-		not near(appliedGain(out), (3.5 / 4) ^ 2))
-	check("shows the aperture it used", contains(report, "aperture   : f3.7 -> target f4"), report)
+		not near(appliedGain(out), (3.5 / TEST_TARGET) ^ 2))
+	check("shows the aperture it used", contains(report, "aperture   : f3.7 -> target f5.6"), report)
 	check("and says the camera disagreed", contains(report, "f3.5 reported"), report)
 	check("naming the zoom position that settles it", contains(report, "only opens to f3.7 at 12mm"),
 		report)
@@ -471,10 +480,10 @@ do
 	local tool = newTool()
 	local _, out = tool:process(meta({ focal_length = "14mm" }), 1)
 	check("interpolates between the measured positions",
-		near(appliedGain(out), (3.9 / 4) ^ 2), appliedGain(out))
+		near(appliedGain(out), (3.9 / TEST_TARGET) ^ 2), appliedGain(out))
 
 	local _, out2 = tool:process(meta({ focal_length = "16mm" }), 2)
-	check("and again further along", near(appliedGain(out2), (4.1 / 4) ^ 2), appliedGain(out2))
+	check("and again further along", near(appliedGain(out2), (4.1 / TEST_TARGET) ^ 2), appliedGain(out2))
 end
 
 do
@@ -482,10 +491,10 @@ do
 	-- extrapolated, which is what the lens does too once it is wide open.
 	local tool = newTool()
 	local _, out = tool:process(meta({ focal_length = "22mm" }), 1)
-	check("holds at the long end", near(appliedGain(out), (4.5 / 4) ^ 2), appliedGain(out))
+	check("holds at the long end", near(appliedGain(out), (4.5 / TEST_TARGET) ^ 2), appliedGain(out))
 
 	local _, out2 = tool:process(meta({ focal_length = "30mm" }), 2)
-	check("and does not extrapolate past it", near(appliedGain(out2), (4.5 / 4) ^ 2), appliedGain(out2))
+	check("and does not extrapolate past it", near(appliedGain(out2), (4.5 / TEST_TARGET) ^ 2), appliedGain(out2))
 end
 
 do
@@ -493,7 +502,7 @@ do
 	-- and the report has nothing extra to say.
 	local tool = newTool()
 	local report, out = tool:process(meta({ focal_length = "10mm" }), 1)
-	check("leaves the wide end alone", near(appliedGain(out), 0.765625), appliedGain(out))
+	check("leaves the wide end alone", near(appliedGain(out), TEST_GAIN), appliedGain(out))
 	check("and says nothing about it", not contains(report, "wide open"), report)
 end
 
@@ -503,7 +512,7 @@ do
 	local tool = newTool()
 	local report, out = tool:process(meta({ focal_length = "12mm", aperture = "f8" }), 1)
 	check("a stopped-down frame is corrected from its own aperture",
-		near(appliedGain(out), (8 / 4) ^ 2), appliedGain(out))
+		near(appliedGain(out), (8 / TEST_TARGET) ^ 2), appliedGain(out))
 	check("with nothing overruled", not contains(report, "reported"), report)
 end
 
@@ -512,10 +521,10 @@ do
 	-- the entire point -- and the cache has to notice.
 	local tool = newTool()
 	local _, out = tool:process(meta({ focal_length = "11mm" }), 1)
-	check("zoom alone moves the correction", near(appliedGain(out), (3.6 / 4) ^ 2), appliedGain(out))
+	check("zoom alone moves the correction", near(appliedGain(out), (3.6 / TEST_TARGET) ^ 2), appliedGain(out))
 
 	local _, out2 = tool:process(meta({ focal_length = "13mm" }), 2)
-	check("and moves it again", near(appliedGain(out2), (3.8 / 4) ^ 2), appliedGain(out2))
+	check("and moves it again", near(appliedGain(out2), (3.8 / TEST_TARGET) ^ 2), appliedGain(out2))
 end
 
 do
@@ -523,7 +532,7 @@ do
 	local tool = newTool()
 	local _, out = tool:process(meta({ focal_length = "<nil>" }), 1)
 	check("without a focal length the reported aperture stands",
-		near(appliedGain(out), 0.765625), appliedGain(out))
+		near(appliedGain(out), TEST_GAIN), appliedGain(out))
 end
 
 do
@@ -533,7 +542,7 @@ do
 	local _, out = tool:process(meta({
 		lens_type = "Sigma 18-35mm f/1.8 DC HSM", focal_length = "12mm" }), 1)
 	check("an unlisted lens is corrected from its metadata alone",
-		near(appliedGain(out), 0.765625), appliedGain(out))
+		near(appliedGain(out), TEST_GAIN), appliedGain(out))
 end
 
 do
@@ -554,138 +563,187 @@ do
 		out2.Metadata.aperture_normalize.reported)
 end
 
-tap.section("normalising to the lens's widest aperture")
+tap.section("filling in the target aperture")
 do
-	-- The shipped default: aim at the widest aperture the lens has, so the
-	-- clip matches its own wide end and every correction brightens.
+	-- The lens turns up, and the slider it would have had to be set to by
+	-- hand gets set for you.
 	local tool = newDefaultTool()
-	check("the control is on by default",
-		tool.AutoTarget.Attrs.INP_Default == 1.0, tool.AutoTarget.Attrs.INP_Default)
+	check("the slider ships at f/4", tool.TargetAperture.value == 4.0, tool.TargetAperture.value)
 
-	local report, out = tool:process(meta({ focal_length = "12mm" }), 1)
-	check("targets f/3.5 rather than the slider's f/4",
-		near(appliedGain(out), (3.7 / 3.5) ^ 2), appliedGain(out))
-	check("says what it targeted", contains(report, "-> target f3.5"), report)
-	check("and where that came from", contains(report, "the widest this lens opens"), report)
-end
-
-do
-	-- At the wide end there is nothing left to undo, since that is where the
-	-- target came from.
-	local tool = newDefaultTool()
-	local _, out = tool:process(meta(), 1)
-	check("the wide end needs no correction", near(appliedGain(out), 1.0), appliedGain(out))
-end
-
-do
-	-- Across the zoom range every correction brightens, which is the point of
-	-- picking the widest: the tool never has to throw light away.
-	local tool = newDefaultTool()
-	for _, focal in ipairs({ "13mm", "17mm", "22mm" }) do
-		local _, out = tool:process(meta({ focal_length = focal }), 1)
-		check("brightens at " .. focal, appliedGain(out) > 1.0, appliedGain(out))
-	end
-
-	local _, out = tool:process(meta({ focal_length = "22mm" }), 2)
-	check("the long end is a full 0.725 stops",
-		near(appliedGain(out), (4.5 / 3.5) ^ 2), appliedGain(out))
-end
-
-do
-	-- Turning it off puts the slider back in charge.
-	local tool = newDefaultTool()
-	tool:set("AutoTarget", 0)
-	local report, out = tool:process(meta({ focal_length = "12mm" }), 1)
-	check("the slider takes over", near(appliedGain(out), (3.7 / 4) ^ 2), appliedGain(out))
-	check("and it stops claiming the lens chose", not contains(report, "widest this lens opens"),
-		report)
-end
-
-do
-	-- An unlisted lens has no widest to aim at, so the slider stands in even
-	-- with the control on. Forcing grants permission, not data.
-	local tool = newDefaultTool()
-	tool:set("Force", 1)
-	local report, out = tool:process(meta({ lens_type = "Sigma 18-35mm f/1.8 DC HSM" }), 1)
-	check("an unlisted lens falls back to the slider",
-		near(appliedGain(out), 0.765625), appliedGain(out))
-	check("and does not pretend otherwise", not contains(report, "widest this lens opens"), report)
-end
-
-do
-	-- The cache has to notice the control, like every other input.
-	local tool = newDefaultTool()
 	local _, out = tool:process(meta({ focal_length = "12mm" }), 1)
-	check("follows the lens first", near(appliedGain(out), (3.7 / 3.5) ^ 2), appliedGain(out))
-
-	tool:set("AutoTarget", 0)
-	local _, out2 = tool:process(meta({ focal_length = "12mm" }), 2)
-	check("and notices when it is switched off", near(appliedGain(out2), (3.7 / 4) ^ 2),
-		appliedGain(out2))
+	check("the lens's widest is written into it", tool.TargetAperture.value == 3.5,
+		tool.TargetAperture.value)
+	check("and it was written, not merely assumed",
+		tool.TargetAperture.sourced[1] == 3.5, tool.TargetAperture.sourced[1])
+	check("the frame is corrected to it straight away",
+		near(appliedGain(out), (3.7 / 3.5) ^ 2), appliedGain(out))
 end
 
-tap.section("Generate Report")
 do
-	local TMP = "test/tmp"
-	os.execute("rm -rf " .. TMP)
+	-- Once it is filled in, it stays filled in rather than being rewritten
+	-- every frame.
+	local tool = newDefaultTool()
+	tool:process(meta(), 1)
+	tool:process(meta({ focal_length = "13mm" }), 2)
+	tool:process(meta({ focal_length = "15mm" }), 3)
+	check("written once, not per frame", #tool.TargetAperture.sourced == 1,
+		#tool.TargetAperture.sourced)
+end
 
-	local function readFile(path)
-		local f = io.open(path, "r")
-		if not f then return nil end
-		local s = f:read("*a")
-		f:close()
-		return s
-	end
+do
+	-- The hazard this has to avoid: a comp where somebody chose a target.
+	local tool = newDefaultTool()
+	tool:set("TargetAperture", 5.6)
+	local _, out = tool:process(meta(), 1)
 
-	local tool = newTool()
-	tool:set("ReportDir", TMP .. "/reports")
-	tool:press("GenerateReport")
-	tool:process(meta(), 7)
+	check("a chosen target is left alone", tool.TargetAperture.value == 5.6,
+		tool.TargetAperture.value)
+	check("nothing was written at all", #tool.TargetAperture.sourced == 0)
+	check("and it is what the frame was corrected to", near(appliedGain(out), TEST_GAIN),
+		appliedGain(out))
+end
 
-	local written = readFile(TMP .. "/reports/aperture-normalize-A067_08211340_C007-7.txt")
-	check("writes a file named for the clip and frame", written ~= nil)
-	check("records the settings", contains(written, "target aperture         : f4"), written)
-	check("records which target was chosen",
-		contains(written, "target the lens's widest: no"), written)
-	check("records the outcome", contains(written, "correction : -0.3853 stops"), written)
-	check("dumps the metadata", contains(written, "lens_type = " .. LENS), written)
-	check("shows the zoom in the outcome", contains(written, "zoom       : 10mm"), written)
-	check("flattens nested metadata", contains(written, "GammaSpace.Gamma = 1"), written)
+do
+	-- A second lens turning up mid-timeline. This one is not in the database,
+	-- so there is no widest to fill in from and the first lens's answer
+	-- stands -- which is the right outcome, but not the same as the tool
+	-- having decided to leave it alone.
+	local tool = newDefaultTool()
+	tool:process(meta(), 1)
+	check("filled in for the first lens", tool.TargetAperture.value == 3.5,
+		tool.TargetAperture.value)
 
-	-- One press, one report.
+	tool:process(meta({ lens_type = "Sigma 18-35mm f/1.8 DC HSM" }), 2)
+	check("an unlisted lens has no widest, so nothing is rewritten",
+		tool.TargetAperture.value == 3.5, tool.TargetAperture.value)
+end
+
+do
+	-- Nothing to fill in from, and nothing broken by that.
+	local tool = newDefaultTool()
+	tool:process(meta({ lens_type = "<nil>" }), 1)
+	check("no lens leaves the slider at its default", tool.TargetAperture.value == 4.0,
+		tool.TargetAperture.value)
+	check("and writes nothing", #tool.TargetAperture.sourced == 0)
+end
+
+tap.section("Console Logging: Errors")
+do
+	-- The shipped default. A clip it understands says nothing whatsoever.
+	local tool = newDefaultTool()
+	local report = tool:process(meta({ focal_length = "12mm" }), 1)
+	check("a corrected frame is silent", report == nil, report)
+	check("nothing was printed at all", #tool.printed == 0, tool.printed[1])
+end
+
+do
+	-- A frame it declines to correct is exactly what this mode is for.
+	local tool = newDefaultTool()
+	local report = tool:process(meta({ lens_type = "Sigma 18-35mm f/1.8 DC HSM" }), 1)
+	check("a pass-through is reported", contains(report, "passing through"), report)
+	check("and says why", contains(report, "not in the lens database"), report)
+end
+
+do
+	-- "Only once" means once per reason, including across a zoom -- which is
+	-- the difference from Corrections, where the zoom is part of what counts
+	-- as a change.
+	local tool = newDefaultTool()
+	local unknown = { lens_type = "Sigma 18-35mm f/1.8 DC HSM" }
+	tool:process(meta(unknown), 1)
 	local before = #tool.printed
-	tool:process(meta(), 8)
-	check("does not keep writing every frame",
-		readFile(TMP .. "/reports/aperture-normalize-A067_08211340_C007-8.txt") == nil)
 
-	-- A skipped frame is worth a report too -- that is when you most want one.
+	for frame = 2, 6 do
+		unknown.focal_length = (10 + frame) .. "mm"
+		tool:process(meta(unknown), frame)
+	end
+	check("said once, not once per frame", #tool.printed == before, #tool.printed - before)
+
+	-- A different reason is a different thing to say.
+	tool:process(meta({ GammaSpace = { Gamma = 2.2 } }), 7)
+	check("but a new reason is still worth saying", #tool.printed == before + 1)
+	check("and it is the new one", contains(tool.printed[#tool.printed], "gamma"),
+		tool.printed[#tool.printed])
+end
+
+do
+	-- None means none, even for the things Errors would report.
+	local tool = newDefaultTool()
+	tool:set("ConsoleLogging", 0)
+	local report, out, img = tool:process(meta({ lens_type = "Nobody's Lens" }), 1)
+	check("None stays silent about pass-throughs", report == nil, report)
+	check("but still passes the frame through", out == img)
+end
+
+tap.section("Console Logging: All Metadata")
+do
+	local tool = newTool()
+	tool:set("ConsoleLogging", 3)
+	local report = tool:process(meta(), 1)
+
+	check("still reports the correction", contains(report, "correction :"), report)
+	check("and lists the fields", contains(report, "metadata   :"), report)
+	check("including ones the correction ignores",
+		contains(report, "Filename") and contains(report, "/clips/A067_08211340_C007.braw"), report)
+	check("flattening nested ones", contains(report, "GammaSpace.Gamma = 1"), report)
+	check("and counting them", contains(report, "6 field(s)"), report)
+	check("nothing is marked on the first frame, having nothing to compare to",
+		not contains(report, "*"), report)
+end
+
+do
+	-- The point of the mode: a field that moves gets marked, so it can be
+	-- picked out of a screenful of fields that didn't.
+	local tool = newTool()
+	tool:set("ConsoleLogging", 3)
+	tool:process(meta(), 1)
+	local report = tool:process(meta({ aperture = "f4.5" }), 2)
+
+	check("says how many moved", contains(report, "1 changed since frame 1"), report)
+	check("marks the one that did", contains(report, "* aperture"), report)
+	check("and shows what it was", contains(report, "(was f3.5)"), report)
+	check("leaving the rest unmarked", contains(report, "  focal_length"), report)
+end
+
+do
+	-- The reason this mode exists: a field nothing else looks at, ticking
+	-- while the zoom and the aperture sit still. Corrections would never
+	-- report this frame, because nothing it computes from has moved.
+	local tool = newTool()
+	tool:set("ConsoleLogging", 2)
+	tool:process(meta({ zoom_encoder = "4821" }), 1)
+	local quiet = tool:process(meta({ zoom_encoder = "4837" }), 2)
+	check("Corrections cannot see it move", quiet == nil, quiet)
+
 	local tool2 = newTool()
-	tool2:set("ReportDir", TMP .. "/reports")
-	tool2:press("GenerateReport")
-	tool2:process(meta({ lens_type = "Sigma 18-35mm f/1.8 DC HSM" }), 9)
-	local skipped = readFile(TMP .. "/reports/aperture-normalize-A067_08211340_C007-9.txt")
-	check("reports a pass-through and why", contains(skipped, "passed through, because"), skipped)
+	tool2:set("ConsoleLogging", 3)
+	tool2:process(meta({ zoom_encoder = "4821" }), 1)
+	local found = tool2:process(meta({ zoom_encoder = "4837" }), 2)
+	check("All Metadata does", contains(found, "* zoom_encoder"), found)
+	check("with both values", contains(found, "4837") and contains(found, "(was 4821)"), found)
+end
 
-	-- With the target following the lens, the slider is still recorded, but
-	-- saying so without saying it went unused would be misleading.
-	local tool4 = newDefaultTool()
-	tool4:set("ReportDir", TMP .. "/reports")
-	tool4:press("GenerateReport")
-	tool4:process(meta({ focal_length = "12mm" }), 11)
-	local auto = readFile(TMP .. "/reports/aperture-normalize-A067_08211340_C007-11.txt")
-	check("records that the lens chose the target",
-		contains(auto, "target the lens's widest: yes"), auto)
-	check("and that the slider went unused", contains(auto, "unused"), auto)
+do
+	-- Fields coming and going are marked too.
+	local tool = newTool()
+	tool:set("ConsoleLogging", 3)
+	tool:process(meta(), 1)
 
-	-- No folder set is a mistake worth naming.
-	local tool3 = newTool()
-	tool3:press("GenerateReport")
-	local report = tool3:process(meta(), 1)
-	check("asks for a folder when none is set",
-		contains(tool3.printed[#tool3.printed], "set a Report Folder first"),
-		tool3.printed[#tool3.printed])
+	local appeared = tool:process(meta({ zoom_encoder = "4821" }), 2)
+	check("a new field is marked as new", contains(appeared, "+ zoom_encoder"), appeared)
 
-	os.execute("rm -rf " .. TMP)
+	local gone = tool:process(meta(), 3)
+	check("and a departed one as gone", contains(gone, "- zoom_encoder"), gone)
+	check("saying what it had been", contains(gone, "was 4821"), gone)
+end
+
+do
+	-- Metadata that isn't there at all is a fact worth printing rather than
+	-- an error.
+	local tool = newTool()
+	tool:set("ConsoleLogging", 3)
+	local report = tool:process(nil, 1)
+	check("says there is none", contains(report, "metadata   : none"), report)
 end
 
 tap.finish()
