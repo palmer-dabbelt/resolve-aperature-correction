@@ -493,39 +493,68 @@ __KERNEL__ void ApertureGainKernel(__CONSTANTREF__ ApertureGainParams *params,
 }
 ]==]
 
--- Returns the corrected image, or nil if the GPU path is unavailable for any
--- reason -- no compute node, a kernel that will not compile, a host with no
--- GPU at all. Every failure is a fallback, never an error.
+-- Returns the corrected image, or nil and a reason. Every failure is a
+-- fallback rather than an error, but which failure it was matters: "no such
+-- function" means this build has no GPU fuse support at all, while a node that
+-- will not run means the kernel itself is at fault and Fusion has logged why.
 local function applyGainGPU(req, img, gain)
+	if type(DVIPComputeNode) ~= "function" then
+		return nil, "this build has no DVIPComputeNode, so GPU kernels are not available to fuses"
+	end
+
 	local out = Image({ IMG_Like = img })
-	if not out then return nil end
+	if not out then
+		return nil, "could not allocate an output image"
+	end
 
 	local node = DVIPComputeNode(req, "ApertureGainKernel", ApertureGainSource,
 		"ApertureGainParams", ApertureGainParams)
-	if not node then return nil end
+	if not node then
+		return nil, "DVIPComputeNode returned nothing; if the kernel failed to compile, " ..
+			"the reason is in the Console just above this"
+	end
 
 	local params = node:GetParamBlock(ApertureGainParams)
+	if not params then
+		return nil, "could not get the kernel parameter block"
+	end
+
 	params.gain = gain
 	params.srcsize[0] = img.DataWindow:Width()
 	params.srcsize[1] = img.DataWindow:Height()
 	node:SetParamBlock(params)
 
-	-- Point sampling in pixel coordinates: this reads each pixel exactly once
-	-- at its own position, so there is nothing to interpolate.
+	-- Point sampling in pixel coordinates: each pixel is read exactly once at
+	-- its own position, so there is nothing to interpolate.
 	node:AddSampler("RowSampler", TEX_FILTER_MODE_POINT, TEX_ADDRESS_MODE_CLAMP,
 		TEX_NORMALIZED_COORDS_FALSE)
 	node:AddInput("src", img)
 	node:AddOutput("dst", out)
 
-	if not node:RunSession(req) then return nil end
+	if not node:RunSession(req) then
+		return nil, "the kernel would not run; any compile error is in the Console just above this"
+	end
+
 	return out
 end
 
-local function applyGainCPU(img, gain)
+-- The documented CPU pattern: copy, then multiply in place. Two passes over
+-- the frame.
+local function applyGainCopy(img, gain)
 	local out = img:CopyOf()
 	out:Gain(gain, gain, gain, 1.0)
 	return out
 end
+
+-- One pass in principle -- it reads and writes the frame once, and skips the
+-- alpha plane entirely -- but it goes through the general channel-boolean
+-- machinery, which may well cost more than it saves. Kept selectable so the
+-- two can be compared on real footage rather than argued about.
+local function applyGainChannelOp(img, gain)
+	return img:ChannelOpOf("Multiply", nil, { R = gain, G = gain, B = gain })
+end
+
+local PROCESSING_GPU, PROCESSING_COPY, PROCESSING_CHANNELOP = 0, 1, 2
 
 -- Once the GPU path has failed there is no reason to expect it to work on the
 -- next frame: the kernel either compiles on this machine or it does not.
@@ -533,19 +562,22 @@ end
 -- is worse than never having tried.
 local gpuUnavailable = false
 
-local function applyGain(req, img, gain, wantGPU)
-	if wantGPU and not gpuUnavailable then
-		-- pcall because a host without the DCTL entry points would otherwise
-		-- raise rather than simply not have a GPU path.
-		local ok, out = pcall(applyGainGPU, req, img, gain)
+local function applyGain(req, img, gain, mode)
+	if mode == PROCESSING_GPU and not gpuUnavailable then
+		-- pcall because a host missing the DCTL entry points entirely would
+		-- raise rather than simply return nothing.
+		local ok, out, reason = pcall(applyGainGPU, req, img, gain)
 		if ok and out then return out end
 
 		gpuUnavailable = true
-		print("-- Aperture Normalize: no GPU path available, using the CPU from here on" ..
-			((not ok) and ("\n   " .. tostring(out)) or ""))
+		print("-- Aperture Normalize: GPU path unavailable, using the CPU from here on\n   " ..
+			(ok and tostring(reason or "no reason given") or ("it raised: " .. tostring(out))))
 	end
 
-	return applyGainCPU(img, gain)
+	if mode == PROCESSING_CHANNELOP then
+		return applyGainChannelOp(img, gain)
+	end
+	return applyGainCopy(img, gain)
 end
 
 local lastSignature = nil
@@ -585,7 +617,8 @@ function Create()
 		INP_Default = 0.0,
 		INP_Integer = true,
 		{ CCS_AddString = "GPU (falls back to CPU)", },
-		{ CCS_AddString = "CPU", },
+		{ CCS_AddString = "CPU: copy + gain", },
+		{ CCS_AddString = "CPU: channel op", },
 		CC_LabelPosition = "Vertical",
 	})
 
@@ -667,7 +700,7 @@ function Process(req)
 		return
 	end
 
-	local out = applyGain(req, img, decision.gain, InProcessing:GetValue(req).Value < 0.5)
+	local out = applyGain(req, img, decision.gain, InProcessing:GetValue(req).Value)
 	stamp(out, decision)
 
 	OutImage:Set(req, out)

@@ -41,6 +41,7 @@ end
 local function appliedGain(out)
 	if out.gpu then return out.gpu.gain end
 	if out.gains[1] then return out.gains[1].r end
+	if out.channelOp then return out.channelOp.options.R end
 	return nil
 end
 
@@ -208,14 +209,28 @@ do
 end
 
 do
-	-- Processing = CPU, for comparing the two paths.
+	-- Processing = CPU: copy + gain.
 	local tool = newTool()
 	tool:set("Processing", 1)
 	local _, out = tool:process(meta(), 1)
 
-	check("CPU path leaves the GPU alone", out.gpu == nil)
-	check("CPU path applies the same gain", near(appliedGain(out), 0.765625), appliedGain(out))
-	check("CPU path leaves alpha at unity", out.gains[1].a == 1.0, out.gains[1].a)
+	check("copy+gain leaves the GPU alone", out.gpu == nil)
+	check("copy+gain applies the same gain", near(appliedGain(out), 0.765625), appliedGain(out))
+	check("copy+gain leaves alpha at unity", out.gains[1].a == 1.0, out.gains[1].a)
+end
+
+do
+	-- Processing = CPU: channel op, the other CPU path, kept for comparison.
+	local tool = newTool()
+	tool:set("Processing", 2)
+	local _, out = tool:process(meta(), 1)
+
+	check("channel op leaves the GPU alone", out.gpu == nil)
+	check("channel op multiplies", out.channelOp and out.channelOp.operation == "Multiply",
+		out.channelOp and out.channelOp.operation)
+	check("channel op applies the same gain",
+		near(out.channelOp.options.R, 0.765625), out.channelOp.options.R)
+	check("channel op leaves alpha out entirely", out.channelOp.options.A == nil)
 end
 
 do
@@ -225,7 +240,10 @@ do
 	local report, out = tool:process(meta(), 1)
 
 	check("falls back to the CPU", out.gpu == nil and near(appliedGain(out), 0.765625), appliedGain(out))
-	check("says so once", contains(tool.printed[#tool.printed], "no GPU path available"),
+	check("says so once", contains(tool.printed[#tool.printed], "GPU path unavailable"),
+		tool.printed[#tool.printed])
+	check("and says which step failed",
+		contains(tool.printed[#tool.printed], "DVIPComputeNode returned nothing"),
 		tool.printed[#tool.printed])
 
 	local before = #tool.printed
@@ -235,7 +253,7 @@ do
 
 	local complaints = 0
 	for i = before + 1, #tool.printed do
-		if contains(tool.printed[i], "no GPU path available") then complaints = complaints + 1 end
+		if contains(tool.printed[i], "GPU path unavailable") then complaints = complaints + 1 end
 	end
 	check("and does not keep saying it", complaints == 0)
 	check("and does not keep retrying it", tool.lastNode == nil)

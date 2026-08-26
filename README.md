@@ -62,7 +62,7 @@ the values it came from.
 | --- | --- |
 | Target Aperture | The f-number to normalise to. Default 4. |
 | Force On Unknown Lenses | Correct lenses that aren't in the database. Off by default. |
-| Processing | *GPU (falls back to CPU)* by default, or *CPU* to compare the two. |
+| Processing | *GPU (falls back to CPU)* by default, or either CPU path, to compare them. |
 | Console Logging | Master switch for Console output. On by default. |
 | Report | *When It Changes* (default) or *Every Frame*. |
 | Report Folder | Where **Generate Report** writes. |
@@ -113,12 +113,22 @@ megabytes.
 Resolve composites on the GPU, so a fuse that touches pixels from Lua drags the
 whole frame down to host memory and back — which costs far more than the
 multiply itself. The correction is therefore a DCTL compute kernel, running
-where the image already is. If no GPU path is available the tool falls back to
-`CopyOf` + `Gain` on the CPU, says so in the Console once, and does not retry:
-the kernel either compiles on a given machine or it does not, and retrying per
+where the image already is.
+
+If the GPU path is unavailable the tool falls back to the CPU, says so in the
+Console once — naming the step that failed, which distinguishes "this build has
+no GPU fuse support" from "the kernel would not compile" — and does not retry.
+The kernel either compiles on a given machine or it does not, and retrying per
 frame would cost a failed compile on top of the CPU work.
 
-**Processing** forces the CPU path, which is there to compare the two.
+**Processing** selects between three paths, so they can be compared on real
+footage rather than argued about:
+
+| Mode | What it does |
+| --- | --- |
+| GPU | The DCTL kernel, falling back to *copy + gain* if it can't run. |
+| CPU: copy + gain | `CopyOf` then `Gain` in place. The documented pattern, two passes over the frame. |
+| CPU: channel op | One multiplying `ChannelOpOf`. One pass in principle, but through general channel-boolean machinery that may cost more than it saves. |
 
 Beyond that:
 
