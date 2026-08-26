@@ -1,0 +1,248 @@
+--[[--
+ApertureProbe
+=============
+
+A diagnostic Fuse that answers exactly one question: does the image arriving at
+this point in the comp carry any lens / aperture metadata at all?
+
+Fusion attaches metadata to images as a plain Lua table hanging off the Image
+object (Image.Metadata, which is nil when the image carries none). Which keys
+actually turn up is entirely down to the media format and the Loader / MediaIn
+that decoded it -- the Fuse SDK's list of "known metadata" documents the old
+DPX/EXR set and says nothing about lens data, so the only way to find out
+whether an aperture value survives the trip into Fusion is to look.
+
+This tool passes its input straight through untouched and prints what it finds
+to the Console (Fusion page -> Workspace -> Console).
+
+By default it reports only when something interesting changes, so it can be
+left in a comp while scrubbing a clip without flooding the Console. "Something
+interesting" means either the set of metadata keys changed, or one of the
+lens / exposure values changed -- fields like TimeCode that tick every frame
+deliberately do not re-trigger a report.
+--]]--
+
+FuRegisterClass("ApertureProbe", CT_Tool, {
+	REGS_Name             = "Aperture Probe",
+	REGS_Category         = "Fuses\\Metadata",
+	REGS_OpIconString     = "APrb",
+	REGS_OpDescription    = "Reports any lens/aperture metadata carried by an image",
+	REG_NoMotionBlurCtrls = true,
+	REG_NoBlendCtrls      = true,
+	REG_OpNoMask          = true,
+	REG_NoPreCalcProcess  = true,
+	REG_SupportsDoD       = true,
+	REG_Fuse_NoJIT        = true,
+})
+
+-- Key fragments denoting the aperture itself. Keys are normalised to lowercase
+-- alphanumerics before matching, so "F-Number", "f_stop" and "FNumber" all
+-- collapse onto the same needle.
+local APERTURE_KEYS = {
+	"aperture", "fnumber", "fstop", "tstop", "tnumber", "iris", "apex",
+}
+
+-- A wider net: fields describing the lens or the exposure. Useful context even
+-- when the aperture itself is absent, and a hint about what the camera does
+-- bother to tag. Short fragments are avoided here on purpose -- "nd" would
+-- match "Vendor", "av" would match "Average".
+local LENS_KEYS = {
+	"lens", "focal", "zoom", "focus", "exposure", "shutter",
+	"iso", "asa", "gain", "whitebalance", "kelvin", "colortemp",
+}
+
+local MAX_DEPTH = 8
+
+local function normalise(key)
+	return (tostring(key):lower():gsub("[^%a%d]", ""))
+end
+
+local function matches(key, needles)
+	local flat = normalise(key)
+	for _, needle in ipairs(needles) do
+		if flat:find(needle, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Metadata values may themselves be tables -- Fusion turns dotted field names
+-- such as "Stereo.Method" into nested tables -- so walk the tree and emit
+-- dotted paths. Guards against cycles and runaway nesting because this is
+-- reading data we did not create.
+local function flatten(tbl, prefix, out, seen, depth)
+	if depth > MAX_DEPTH then
+		out[#out + 1] = { key = prefix .. "*", value = "<nested deeper than " .. MAX_DEPTH .. " levels>" }
+		return out
+	end
+
+	seen[tbl] = true
+
+	local keys = {}
+	for k in pairs(tbl) do
+		keys[#keys + 1] = k
+	end
+	table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+
+	for _, k in ipairs(keys) do
+		local v = tbl[k]
+		local path = prefix .. tostring(k)
+
+		if type(v) ~= "table" then
+			out[#out + 1] = { key = path, value = tostring(v) }
+		elseif seen[v] then
+			out[#out + 1] = { key = path, value = "<circular reference>" }
+		elseif next(v) == nil then
+			out[#out + 1] = { key = path, value = "<empty table>" }
+		else
+			flatten(v, path .. ".", out, seen, depth + 1)
+		end
+	end
+
+	seen[tbl] = nil
+	return out
+end
+
+-- What counts as "worth reporting again": the shape of the metadata, plus the
+-- values of the fields we actually care about. Deliberately excludes values
+-- like TimeCode and Filename that change on every single frame.
+local function signature(fields)
+	local parts = {}
+	for _, f in ipairs(fields) do
+		if matches(f.key, APERTURE_KEYS) or matches(f.key, LENS_KEYS) then
+			parts[#parts + 1] = f.key .. "=" .. f.value
+		else
+			parts[#parts + 1] = f.key
+		end
+	end
+	return table.concat(parts, "\n")
+end
+
+local function toolName()
+	local ok, attrs = pcall(function() return self:GetAttrs() end)
+	if ok and type(attrs) == "table" and attrs.TOOLS_Name then
+		return attrs.TOOLS_Name
+	end
+	return "ApertureProbe"
+end
+
+-- Remembers the last signature reported, so "When It Changes" has something to
+-- compare against. Each tool instance gets its own Lua state, so a plain local
+-- is per-instance state.
+local lastSignature = nil
+
+function Create()
+	InImage = self:AddInput("Input", "Input", {
+		LINKID_DataType = "Image",
+		LINK_Main = 1,
+	})
+
+	OutImage = self:AddOutput("Output", "Output", {
+		LINKID_DataType = "Image",
+		LINK_Main = 1,
+	})
+
+	InWhen = self:AddInput("Report", "Report", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "ComboControl",
+		INP_Default = 0.0,
+		INP_Integer = true,
+		{ CCS_AddString = "When It Changes", },
+		{ CCS_AddString = "Every Frame", },
+		{ CCS_AddString = "Never", },
+		CC_LabelPosition = "Vertical",
+	})
+
+	InDumpAll = self:AddInput("List Every Field", "DumpAll", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "CheckboxControl",
+		INP_Integer = true,
+		INP_Default = 1.0,
+	})
+
+	InAgain = self:AddInput("Report Again", "ReportAgain", {
+		LINKID_DataType = "Text",
+		INPID_InputControl = "ButtonControl",
+		INP_DoNotifyChanged = true,
+		INP_External = false,
+	})
+end
+
+function NotifyChanged(inp, param, time)
+	if inp == InAgain then
+		-- Forget what we last saw so the next render reports from scratch.
+		lastSignature = nil
+	end
+end
+
+function Process(req)
+	local img = InImage:GetValue(req)
+
+	local when = InWhen:GetValue(req).Value
+	if when == 2 then                            -- Never
+		OutImage:Set(req, img)
+		return
+	end
+
+	local meta = img.Metadata
+	local fields = {}
+	if type(meta) == "table" then
+		flatten(meta, "", fields, {}, 1)
+	end
+
+	local sig = signature(fields)
+	if when == 0 and sig == lastSignature then   -- When It Changes
+		OutImage:Set(req, img)
+		return
+	end
+	lastSignature = sig
+
+	local aperture, lens, other = {}, {}, {}
+	for _, f in ipairs(fields) do
+		local line = "    " .. f.key .. " = " .. f.value
+		if matches(f.key, APERTURE_KEYS) then
+			aperture[#aperture + 1] = line
+		elseif matches(f.key, LENS_KEYS) then
+			lens[#lens + 1] = line
+		else
+			other[#other + 1] = line
+		end
+	end
+
+	local out = {}
+	out[#out + 1] = "-- Aperture Probe [" .. toolName() .. "] frame " .. tostring(req:GetTime()) .. " --"
+
+	if meta == nil then
+		out[#out + 1] = "  no metadata at all (Image.Metadata is nil)"
+	elseif type(meta) ~= "table" then
+		out[#out + 1] = "  Image.Metadata is a " .. type(meta) .. ", not a table"
+	elseif #fields == 0 then
+		out[#out + 1] = "  metadata table present but empty"
+	else
+		out[#out + 1] = "  " .. #fields .. " field(s) total"
+
+		if #aperture > 0 then
+			out[#out + 1] = "  APERTURE:"
+			for _, l in ipairs(aperture) do out[#out + 1] = l end
+		else
+			out[#out + 1] = "  APERTURE: none found"
+		end
+
+		if #lens > 0 then
+			out[#out + 1] = "  lens / exposure:"
+			for _, l in ipairs(lens) do out[#out + 1] = l end
+		end
+
+		if InDumpAll:GetValue(req).Value > 0.5 and #other > 0 then
+			out[#out + 1] = "  everything else:"
+			for _, l in ipairs(other) do out[#out + 1] = l end
+		end
+	end
+
+	-- One print call: Process can run on several threads at once, and printing
+	-- line by line would let reports interleave in the Console.
+	print(table.concat(out, "\n"))
+
+	OutImage:Set(req, img)
+end
