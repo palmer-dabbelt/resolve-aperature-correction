@@ -85,22 +85,31 @@ before Fusion sees it.
 ## Installing
 
 ```sh
-./install.sh            # symlink into Resolve's Fuses directory
-./install.sh --copy     # copy instead
+make install         # symlink into Resolve's Fuses directory
+make install-copy    # copy instead of symlinking
+make uninstall       # remove them again
 ```
 
 Symlinking means edits to the repository take effect the next time Resolve
-starts, without reinstalling. The installer refuses to overwrite a file it
-didn't put there unless you pass `--force`.
+starts, without reinstalling.
 
 Fuses are loaded at startup, so **restart Resolve** afterwards. The tool then
 appears in the Fusion page's Effects Library under **Fuses → Metadata → Aperture
 Probe**, or via Shift+Space as "Aperture Probe".
 
-Installed to:
+The default destination is:
 
 - macOS: `~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Fuses`
 - Linux: `~/.local/share/DaVinciResolve/Fusion/Fuses`
+
+Override it with `make install FUSEDIR=...` — useful for the system-wide
+`/Library/Application Support/...` folder, or for testing somewhere harmless.
+`make help` prints the path it would use.
+
+`install` refuses to overwrite anything it didn't put there, and `uninstall`
+only removes a symlink pointing back into this repository or a copy still
+byte-identical to ours; anything else is left alone and reported. Pass `FORCE=1`
+to install over a stranger anyway.
 
 ## Tests
 
@@ -108,13 +117,20 @@ The reporting logic runs against a stubbed-out Fusion host, so it can be tested
 without launching Resolve:
 
 ```sh
-luajit test/test_apertureprobe.lua
+make test     # run the suite
+make check    # syntax-check the Lua without running it
+make          # both
 ```
 
 `test/harness.lua` implements just enough of the Fuse API — `AddInput`,
 `AddOutput`, `Input:GetValue`, `Output:Set`, `Request:GetTime` and a captured
 `print` — to load a `.fuse` into a sandbox and drive `Process()` against
-synthetic metadata. Any Lua 5.1-compatible interpreter works.
+synthetic metadata.
+
+Any Lua 5.1-compatible interpreter works; the default is `luajit`, overridable
+with `make test LUA=lua5.1`. `make install` runs `check` first so a fuse that
+won't parse never reaches Resolve, but tolerates having no interpreter at all
+rather than making Lua a prerequisite for installing.
 
 ## Reference
 
