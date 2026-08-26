@@ -85,26 +85,41 @@ before Fusion sees it.
 ## Installing
 
 ```sh
-make install         # symlink into Resolve's Fuses directory
-make install-copy    # copy instead of symlinking
+make install         # install into Resolve's Fuses directory
 make uninstall       # remove them again
 ```
-
-Symlinking means edits to the repository take effect the next time Resolve
-starts, without reinstalling.
 
 Fuses are loaded at startup, so **restart Resolve** afterwards. The tool then
 appears in the Fusion page's Effects Library under **Fuses → Metadata → Aperture
 Probe**, or via Shift+Space as "Aperture Probe".
 
-The default destination is:
+### Where it installs, and why it might not be where you expect
+
+The Mac App Store build of Resolve is sandboxed, so the Fusion profile it
+actually reads is redirected into the app's container:
+
+```
+~/Library/Containers/com.blackmagic-design.DaVinciResolveLite/Data/Library/Application Support/Fusion/Fuses
+```
+
+The non-sandboxed build uses the obvious path instead:
 
 - macOS: `~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Fuses`
 - Linux: `~/.local/share/DaVinciResolve/Fusion/Fuses`
 
-Override it with `make install FUSEDIR=...` — useful for the system-wide
-`/Library/Application Support/...` folder, or for testing somewhere harmless.
-`make help` prints the path it would use.
+Installing to the wrong one of those looks like it succeeded and silently does
+nothing, which is an annoying way to lose half an hour. `make install` detects
+a container and prefers it; `make help` prints the path it would use, so check
+that first if a fuse isn't showing up.
+
+Override with `make install FUSEDIR=...` for anywhere else — the system-wide
+`/Library/Application Support/...` folder, or a scratch directory for testing.
+
+Installs are copies when the destination is inside a sandbox container, because
+a sandboxed Resolve can't read through a symlink pointing out of it, and
+symlinks elsewhere so that edits take effect on the next Resolve restart. Force
+either with `make install-copy` or `make install-symlink`. **After editing a
+fuse that was installed as a copy, re-run `make install`.**
 
 `install` refuses to overwrite anything it didn't put there, and `uninstall`
 only removes a symlink pointing back into this repository or a copy still

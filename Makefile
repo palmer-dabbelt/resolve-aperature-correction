@@ -1,12 +1,16 @@
 # Build infrastructure for the fuses in this repository.
 #
 #   make            syntax-check and run the tests
-#   make install    symlink the fuses into Resolve's Fuses directory
-#   make install-copy   copy them instead of symlinking
+#   make install    install the fuses into Resolve's Fuses directory
+#   make install-copy     force a copy
+#   make install-symlink  force a symlink
 #   make uninstall  remove them again
 #   make test       run the test suite
 #   make check      syntax-check the Lua without running it
 #   make help       list the targets
+#
+# "make install" copies or symlinks depending on where it is installing to;
+# see DEFAULT_MODE below.
 #
 # Resolve only loads fuses at startup, so restart it after installing.
 #
@@ -23,30 +27,63 @@ TESTS := test/test_apertureprobe.lua
 
 UNAME_S := $(shell uname -s)
 
+# The Mac App Store build of Resolve is sandboxed, so the Fusion profile it
+# actually reads lives inside the app's container -- not in the
+# ~/Library/Application Support/Blackmagic Design/... path the non-sandboxed
+# build uses. Installing to the latter looks like it worked and silently does
+# nothing, so prefer a container whenever one is present.
+CONTAINERS := $(HOME)/Library/Containers
+FUSION_PROFILE := $(shell \
+	for d in "$(CONTAINERS)"/com.blackmagic-design.DaVinciResolve*/Data/Library/"Application Support"/Fusion; do \
+		if [ -d "$$d" ]; then echo "$$d"; exit 0; fi; \
+	done)
+
+ifeq ($(origin FUSEDIR),undefined)
 ifeq ($(UNAME_S),Darwin)
-FUSEDIR ?= $(HOME)/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Fuses
+ifeq ($(FUSION_PROFILE),)
+FUSEDIR := $(HOME)/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Fuses
+else
+FUSEDIR := $(FUSION_PROFILE)/Fuses
+endif
 endif
 ifeq ($(UNAME_S),Linux)
-FUSEDIR ?= $(HOME)/.local/share/DaVinciResolve/Fusion/Fuses
+FUSEDIR := $(HOME)/.local/share/DaVinciResolve/Fusion/Fuses
+endif
 endif
 FUSEDIR ?=
+
+# A sandboxed Resolve can't read through a symlink pointing out of its
+# container, so installing there has to copy. Elsewhere symlinking is better:
+# edits to this repository take effect on the next Resolve restart.
+ifeq ($(FUSION_PROFILE),)
+DEFAULT_MODE := symlink
+else
+DEFAULT_MODE := copy
+endif
 
 # FUSEDIR contains spaces on macOS, so it is only ever used quoted inside a
 # recipe -- never as a target or prerequisite, where make would split it.
 
-.PHONY: all help check test install install-copy uninstall
+.PHONY: all help check test install install-copy install-symlink uninstall
 
 all: check test
 
 help:
 	@echo 'targets:'
-	@echo '  make install       symlink the fuses into Resolve (FORCE=1 to overwrite strangers)'
-	@echo '  make install-copy  copy them instead of symlinking'
-	@echo '  make uninstall     remove the fuses this repository installed'
-	@echo '  make test          run the test suite'
-	@echo '  make check         syntax-check the Lua'
+	@echo '  make install          install into Resolve (FORCE=1 to overwrite strangers)'
+	@echo '  make install-copy     force a copy'
+	@echo '  make install-symlink  force a symlink'
+	@echo '  make uninstall        remove the fuses this repository installed'
+	@echo '  make test             run the test suite'
+	@echo '  make check            syntax-check the Lua'
 	@echo
 	@echo 'installing to: $(FUSEDIR)'
+	@echo 'install mode:  $(DEFAULT_MODE)'
+ifeq ($(FUSION_PROFILE),)
+	@echo 'no sandboxed Resolve container found; using the plain support path'
+else
+	@echo 'sandboxed Resolve detected, so installing copies rather than symlinks'
+endif
 
 # Tolerant of a missing interpreter: not having Lua on the box shouldn't stop
 # someone installing a fuse. "make test" is the one that insists.
@@ -62,10 +99,11 @@ test:
 		{ echo "$(LUA) not found; install a Lua 5.1-compatible interpreter or set LUA=" >&2; exit 1; }
 	@$(LUA) $(TESTS)
 
-install: MODE := symlink
+install: MODE := $(DEFAULT_MODE)
 install-copy: MODE := copy
+install-symlink: MODE := symlink
 
-install install-copy: check
+install install-copy install-symlink: check
 	@set -e; \
 	dest="$(FUSEDIR)"; \
 	if [ -z "$$dest" ]; then \
@@ -105,6 +143,9 @@ install install-copy: check
 		echo "installed $$name -> $$target"; \
 	done; \
 	echo; \
+	if [ "$(MODE)" = "copy" ]; then \
+		echo "Installed as copies, so re-run 'make install' after editing a fuse."; \
+	fi; \
 	echo "Restart Resolve, then look under Fuses > Metadata."
 
 # Only removes what this repository put there: a symlink pointing back here, or
