@@ -28,6 +28,15 @@ function harness.image(metadata)
 		self.gains[#self.gains + 1] = { r = r, g = g, b = b, a = a }
 	end
 
+	-- Returns a new image, as the real one does, recording the operation so a
+	-- test can assert on the correction that was applied.
+	function img:ChannelOpOf(operation, fg, options)
+		local result = harness.image(self.Metadata)
+		result.copiedFrom = self
+		result.channelOp = { operation = operation, fg = fg, options = options }
+		return result
+	end
+
 	return img
 end
 

@@ -1,7 +1,8 @@
 # Build infrastructure for the fuses in this repository.
 #
 #   make            syntax-check and run the tests
-#   make install    install the fuses into Resolve's Fuses directory
+#   make install    install into Resolve's Fuses directory
+#   make install-all      install every fuse, including the probe
 #   make install-copy     force a copy
 #   make install-symlink  force a symlink
 #   make uninstall  remove them again
@@ -17,11 +18,17 @@
 # Overridable:
 #   LUA=lua5.1          interpreter used for check and test
 #   FUSEDIR=/some/path  where to install (defaults per platform, below)
+#   INSTALL_FUSES=...   which fuses to install (default: the normaliser only)
 #   FORCE=1             overwrite files in FUSEDIR we didn't install
 
 LUA ?= luajit
 
-FUSES := $(wildcard Fuses/*.fuse)
+ALL_FUSES := $(wildcard Fuses/*.fuse)
+
+# Aperture Probe is a diagnostic: useful when working out what a camera tags,
+# but not something to leave in a comp, and Aperture Normalize can write its
+# own report now. So only the normaliser is installed unless asked otherwise.
+INSTALL_FUSES ?= Fuses/ApertureNormalize.fuse
 LUA_SOURCES := $(wildcard test/*.lua)
 TESTS := $(wildcard test/test_*.lua)
 
@@ -64,19 +71,31 @@ endif
 # FUSEDIR contains spaces on macOS, so it is only ever used quoted inside a
 # recipe -- never as a target or prerequisite, where make would split it.
 
-.PHONY: all help check test install install-copy install-symlink uninstall
+# Sets $ours to yes when the file already at $target is one of ours: it
+# registers the same fuse class as the file we are about to put there. Content
+# comparison is not enough, because an install made by copying stops matching
+# the repository the moment the fuse is edited -- which is exactly when it
+# needs reinstalling. Two fuses registering one class could not coexist in
+# Fusion anyway, so replacing it is the only sensible reading.
+define fuse_is_ours
+class=`sed -n 's/.*FuRegisterClass("\([A-Za-z0-9_]*\)".*/\1/p' "$$fuse" | head -1`; if [ -n "$$class" ] && grep -q "FuRegisterClass(\"$$class\"" "$$target" 2>/dev/null; then ours=yes; else ours=no; fi
+endef
+
+.PHONY: all help check test install install-copy install-symlink install-all uninstall
 
 all: check test
 
 help:
 	@echo 'targets:'
 	@echo '  make install          install into Resolve (FORCE=1 to overwrite strangers)'
+	@echo '  make install-all      install every fuse, including the probe'
 	@echo '  make install-copy     force a copy'
 	@echo '  make install-symlink  force a symlink'
 	@echo '  make uninstall        remove the fuses this repository installed'
 	@echo '  make test             run the test suite'
 	@echo '  make check            syntax-check the Lua'
 	@echo
+	@echo 'installing:    $(notdir $(INSTALL_FUSES))'
 	@echo 'installing to: $(FUSEDIR)'
 	@echo 'install mode:  $(DEFAULT_MODE)'
 ifeq ($(FUSION_PROFILE),)
@@ -89,7 +108,7 @@ endif
 # someone installing a fuse. "make test" is the one that insists.
 check:
 	@if command -v $(LUA) >/dev/null 2>&1; then \
-		$(LUA) test/syntax.lua $(FUSES) $(LUA_SOURCES); \
+		$(LUA) test/syntax.lua $(ALL_FUSES) $(LUA_SOURCES); \
 	else \
 		echo "skipping syntax check ($(LUA) not found; override with LUA=)"; \
 	fi
@@ -107,20 +126,22 @@ test:
 install: MODE := $(DEFAULT_MODE)
 install-copy: MODE := copy
 install-symlink: MODE := symlink
+install-all: MODE := $(DEFAULT_MODE)
+install-all: INSTALL_FUSES := $(ALL_FUSES)
 
-install install-copy install-symlink: check
+install install-copy install-symlink install-all: check
 	@set -e; \
 	dest="$(FUSEDIR)"; \
 	if [ -z "$$dest" ]; then \
 		echo "no default Fuses directory for $(UNAME_S); pass FUSEDIR=..." >&2; \
 		exit 1; \
 	fi; \
-	if [ -z "$(strip $(FUSES))" ]; then \
-		echo "no .fuse files found in Fuses/" >&2; \
+	if [ -z "$(strip $(INSTALL_FUSES))" ]; then \
+		echo "no .fuse files selected to install" >&2; \
 		exit 1; \
 	fi; \
 	mkdir -p "$$dest"; \
-	for fuse in $(FUSES); do \
+	for fuse in $(INSTALL_FUSES); do \
 		name=`basename "$$fuse"`; \
 		target="$$dest/$$name"; \
 		if [ -L "$$target" ]; then \
@@ -134,7 +155,8 @@ install install-copy install-symlink: check
 					fi ;; \
 			esac; \
 		elif [ -e "$$target" ]; then \
-			if [ -z "$(FORCE)" ]; then \
+			$(fuse_is_ours); \
+			if [ "$$ours" = no ] && [ -z "$(FORCE)" ]; then \
 				echo "refusing to replace existing file $$target; re-run with FORCE=1" >&2; \
 				exit 1; \
 			fi; \
@@ -162,7 +184,7 @@ uninstall:
 		echo "no default Fuses directory for $(UNAME_S); pass FUSEDIR=..." >&2; \
 		exit 1; \
 	fi; \
-	for fuse in $(FUSES); do \
+	for fuse in $(ALL_FUSES); do \
 		name=`basename "$$fuse"`; \
 		target="$$dest/$$name"; \
 		if [ -L "$$target" ]; then \
@@ -172,10 +194,11 @@ uninstall:
 				*) echo "left $$target alone (symlink to $$existing)" ;; \
 			esac; \
 		elif [ -e "$$target" ]; then \
-			if cmp -s "$$fuse" "$$target"; then \
+			$(fuse_is_ours); \
+			if [ "$$ours" = yes ]; then \
 				rm -f "$$target"; echo "removed $$target"; \
 			else \
-				echo "left $$target alone (differs from $$fuse)"; \
+				echo "left $$target alone (not one of ours)"; \
 			fi; \
 		else \
 			echo "not installed: $$name"; \

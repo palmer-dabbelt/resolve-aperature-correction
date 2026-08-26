@@ -44,6 +44,14 @@ printed once to the Console:
 - the image isn't in linear light (a gain is only meaningful there)
 - the correction works out larger than 3 stops, which means the metadata is
   lying rather than that the shot needs it
+- the correction is smaller than a thousandth of a stop — the frame is already
+  at the target aperture, and that is invisible
+
+**Force On Unknown Lenses** overrides the second of those: an unlisted lens, or
+metadata with no `lens_type` at all, gets corrected from whatever aperture it
+reports. It deliberately does *not* override the rest. Those are cases where
+the maths would be wrong rather than merely unvouched-for, and forcing is about
+lenses you know are fine, not about overriding arithmetic.
 
 When it *does* correct, it stamps `aperture_normalize.{gain,stops,from,target,lens}`
 into the output metadata, so an Aperture Probe placed downstream — or its CSV
@@ -52,7 +60,36 @@ dump — shows the correction next to the values it came from.
 | Control | What it does |
 | --- | --- |
 | Target Aperture | The f-number to normalise to. Default 4. |
+| Force On Unknown Lenses | Correct lenses that aren't in the database. Off by default. |
 | Report | *When It Changes* (default), *Every Frame*, or *Never*. |
+| Report Folder | Where **Generate Report** writes. |
+| Generate Report | Dumps the current frame's full state to a file. |
+
+#### Generate Report
+
+Pick a **Report Folder**, then press **Generate Report**. The next frame that
+renders writes `aperture-normalize-<clip>-<frame>.txt` there, containing the
+settings in force, what the tool decided and why, and a complete dump of the
+frame's metadata with nested fields flattened to dotted paths.
+
+It fires once per press rather than continuously, and it's most useful on a
+frame that *isn't* being corrected — the report says exactly which check
+rejected it. This is what replaced needing Aperture Probe in the comp.
+
+#### Performance
+
+The tool runs on every frame of playback, and a 6K frame is a few hundred
+megabytes, so the per-frame cost is mostly memory traffic:
+
+- The correction is a single `ChannelOpOf("Multiply", ...)`, which reads the
+  frame and writes the result once. `CopyOf` followed by `Gain` — the pattern
+  the SDK example uses — walks the whole image twice.
+- Alpha is left out of the operation entirely rather than multiplied by 1.
+- A frame needing no correction is passed through by reference, so a clip shot
+  at the target aperture costs nothing at all.
+- The decision is recomputed only when something it depends on changes: the
+  lens, the aperture, the encoding, or a control. On a static shot that is once
+  per clip rather than once per frame.
 
 #### The lens database
 
@@ -84,7 +121,8 @@ leave it nil than to guess.
 
 ### Aperture Probe
 
-A pass-through diagnostic. It doesn't touch the image; it prints whatever
+Not installed by default — `make install-all` if you want it. A pass-through
+diagnostic. It doesn't touch the image; it prints whatever
 metadata is riding along with it to the Fusion Console, and calls out anything
 that looks lens-related.
 
@@ -180,9 +218,15 @@ before Fusion sees it.
 ## Installing
 
 ```sh
-make install         # install into Resolve's Fuses directory
-make uninstall       # remove them again
+make install         # install Aperture Normalize
+make install-all     # ...and Aperture Probe too
+make uninstall       # remove whatever this repository installed
 ```
+
+`make install` deliberately installs only **Aperture Normalize**. The probe is
+a diagnostic rather than something to leave in a comp, and the normaliser can
+write its own report now. `make uninstall` still sweeps both, so it cleans up
+after an earlier `install-all`.
 
 Fuses are loaded at startup, so **restart Resolve** afterwards. The tool then
 appears in the Fusion page's Effects Library under **Fuses → Metadata → Aperture

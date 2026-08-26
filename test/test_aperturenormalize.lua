@@ -18,9 +18,11 @@ local function newTool()
 	return harness.load(FUSE)
 end
 
--- BRAW-ish metadata, with any field overridable per test.
+-- BRAW-ish metadata, with any field overridable per test. Pass "<nil>" to drop
+-- a field entirely.
 local function meta(over)
 	local m = {
+		Filename = "/clips/A067_08211340_C007.braw",
 		lens_type = LENS,
 		aperture = "f3.5",
 		focal_length = "10mm",
@@ -33,12 +35,16 @@ local function meta(over)
 	return m
 end
 
--- Asserts the frame was passed through untouched.
+-- The gain a correcting frame applied, or nil if it passed through.
+local function appliedGain(out)
+	return out.channelOp and out.channelOp.options and out.channelOp.options.R
+end
+
 local function checkPassThrough(label, metadata, tool)
 	tool = tool or newTool()
 	local report, out, img = tool:process(metadata, 1)
 	check(label .. ": output is the input", out == img, report)
-	check(label .. ": no gain applied", #img.gains == 0)
+	check(label .. ": nothing was applied", out.channelOp == nil)
 	check(label .. ": says so in the Console", contains(report, "passing through"), report)
 	return report
 end
@@ -58,12 +64,14 @@ do
 	local tool = newTool()
 	local report, out, img = tool:process(meta(), 1)
 
-	check("output is a copy, not the input", out ~= img and out.copiedFrom == img)
-	check("gain applied once", #out.gains == 1, #out.gains)
-	check("gain is (3.5/4)^2", near(out.gains[1].r, 0.765625), out.gains[1] and out.gains[1].r)
+	check("output is a new image", out ~= img and out.copiedFrom == img)
+	check("multiplies in a single pass", out.channelOp and out.channelOp.operation == "Multiply",
+		out.channelOp and out.channelOp.operation)
+	check("gain is (3.5/4)^2", near(appliedGain(out), 0.765625), appliedGain(out))
 	check("applied equally to R, G and B",
-		out.gains[1].r == out.gains[1].g and out.gains[1].g == out.gains[1].b)
-	check("alpha is left alone", out.gains[1].a == 1.0, out.gains[1] and out.gains[1].a)
+		out.channelOp.options.R == out.channelOp.options.G and
+		out.channelOp.options.G == out.channelOp.options.B)
+	check("alpha is left out entirely", out.channelOp.options.A == nil)
 	check("reports the stops", contains(report, "-0.385 stops"), report)
 	check("names the lens", contains(report, LENS), report)
 end
@@ -72,15 +80,7 @@ do
 	-- f/4.5 is dimmer than f/4, so normalising brightens.
 	local tool = newTool()
 	local _, out = tool:process(meta({ aperture = "f4.5" }), 1)
-	check("f/4.5 brightens", near(out.gains[1].r, (4.5 / 4) ^ 2), out.gains[1].r)
-end
-
-do
-	-- Already at the target: a no-op correction, but still a real one.
-	local tool = newTool()
-	local report, out = tool:process(meta({ aperture = "f4" }), 1)
-	check("f/4 to f/4 is unity gain", near(out.gains[1].r, 1.0), out.gains[1].r)
-	check("and reports zero stops", contains(report, "+0.000 stops"), report)
+	check("f/4.5 brightens", near(appliedGain(out), (4.5 / 4) ^ 2), appliedGain(out))
 end
 
 tap.section("target aperture")
@@ -88,7 +88,7 @@ do
 	local tool = newTool()
 	tool:set("TargetAperture", 5.6)
 	local _, out = tool:process(meta(), 1)
-	check("honours a different target", near(out.gains[1].r, (3.5 / 5.6) ^ 2), out.gains[1].r)
+	check("honours a different target", near(appliedGain(out), (3.5 / 5.6) ^ 2), appliedGain(out))
 end
 
 do
@@ -102,9 +102,7 @@ do
 	for _, written in ipairs({ "f3.5", "F3.5", "F/3.5", "3.5", "f 3.5" }) do
 		local tool = newTool()
 		local _, out = tool:process(meta({ aperture = written }), 1)
-		check('reads "' .. written .. '"',
-			out.gains[1] ~= nil and near(out.gains[1].r, 0.765625),
-			out.gains[1] and out.gains[1].r)
+		check('reads "' .. written .. '"', near(appliedGain(out), 0.765625), appliedGain(out))
 	end
 end
 
@@ -124,19 +122,60 @@ do
 	r = checkPassThrough("aperture the lens cannot reach", meta({ aperture = "f1.8" }))
 	check("explains the range", contains(r, "outside"), r)
 
-	-- A gain is only valid on linear light.
 	r = checkPassThrough("non-linear image", meta({ GammaSpace = { Gamma = 2.2 } }))
 	check("mentions the gamma", contains(r, "2.2"), r)
 end
 
 do
-	-- A correction this big means the metadata is lying, not that the shot
-	-- needs three and a half stops.
 	local tool = newTool()
 	tool:set("TargetAperture", 0.5)
 	local report, out, img = tool:process(meta({ aperture = "f29" }), 1)
-	check("absurd correction is refused", out == img and #img.gains == 0, report)
+	check("absurd correction is refused", out == img and out.channelOp == nil, report)
 	check("says why", contains(report, "too large"), report)
+end
+
+tap.section("a correction too small to see is not worth a copy")
+do
+	local r = checkPassThrough("already at the target", meta({ aperture = "f4" }))
+	check("says it is already there", contains(r, "already at the target aperture"), r)
+end
+
+tap.section("Force On Unknown Lenses")
+do
+	local tool = newTool()
+	tool:set("Force", 1)
+	local report, out = tool:process(meta({ lens_type = "Sigma 18-35mm f/1.8 DC HSM" }), 1)
+	check("corrects an unlisted lens", near(appliedGain(out), 0.765625), appliedGain(out))
+	check("says the correction was forced", contains(report, "forced"), report)
+	check("still names the lens", contains(report, "Sigma 18-35mm f/1.8 DC HSM"), report)
+end
+
+do
+	local tool = newTool()
+	tool:set("Force", 1)
+	local report, out = tool:process(meta({ lens_type = "<nil>" }), 1)
+	check("covers metadata with no lens at all", near(appliedGain(out), 0.765625), appliedGain(out))
+	check("calls it unidentified", contains(report, "unidentified lens"), report)
+end
+
+do
+	-- Forcing is about unknown lenses, not about overriding the maths.
+	local tool = newTool()
+	tool:set("Force", 1)
+	checkPassThrough("forcing does not override missing aperture",
+		meta({ lens_type = "<nil>", aperture = "<nil>" }), tool)
+
+	local tool2 = newTool()
+	tool2:set("Force", 1)
+	checkPassThrough("forcing does not override non-linear light",
+		meta({ GammaSpace = { Gamma = 2.2 } }), tool2)
+end
+
+do
+	-- A listed lens keeps its range check even when forcing.
+	local tool = newTool()
+	tool:set("Force", 1)
+	checkPassThrough("forcing keeps a known lens's range check", meta({ aperture = "f1.8" }), tool)
 end
 
 tap.section("lens matching")
@@ -150,7 +189,7 @@ do
 	}) do
 		local tool = newTool()
 		local _, out = tool:process(meta({ lens_type = spelling }), 1)
-		check("matches " .. string.format("%q", spelling), out.gains[1] ~= nil)
+		check("matches " .. string.format("%q", spelling), appliedGain(out) ~= nil)
 	end
 end
 
@@ -166,10 +205,34 @@ do
 	check("records the source aperture", stamped and stamped.from == "f3.5", stamped and stamped.from)
 	check("records the target", stamped and stamped.target == "f4", stamped and stamped.target)
 	check("records the lens", stamped and stamped.lens == LENS)
+	check("records that it was not forced", stamped and stamped.forced == "0", stamped and stamped.forced)
 	check("keeps the original fields", out.Metadata.focal_length == "10mm")
 
 	check("does not mutate the input's metadata", input.aperture_normalize == nil)
 	check("input image metadata untouched", img.Metadata.aperture_normalize == nil)
+end
+
+tap.section("decisions are cached across frames")
+do
+	local tool = newTool()
+	local first = tool:process(meta(), 1)
+	local _, out = tool:process(meta({ aperture = "f3.5" }), 2)
+	check("same inputs still correct on later frames", near(appliedGain(out), 0.765625), appliedGain(out))
+
+	-- Changing an input the decision depends on must invalidate the cache.
+	local _, out2 = tool:process(meta({ aperture = "f4.5" }), 3)
+	check("a new aperture is noticed", near(appliedGain(out2), (4.5 / 4) ^ 2), appliedGain(out2))
+
+	tool:set("TargetAperture", 5.6)
+	local _, out3 = tool:process(meta({ aperture = "f4.5" }), 4)
+	check("a new target is noticed", near(appliedGain(out3), (4.5 / 5.6) ^ 2), appliedGain(out3))
+
+	tool:set("Force", 1)
+	local _, out4 = tool:process(meta({ lens_type = "Nikon 50mm", aperture = "f4.5" }), 5)
+	check("a new force setting is noticed", appliedGain(out4) ~= nil)
+
+	local _, out5 = tool:process(meta({ GammaSpace = { Gamma = 2.2 } }), 6)
+	check("a new gamma is noticed", out5.channelOp == nil)
 end
 
 tap.section("reporting")
@@ -199,7 +262,57 @@ do
 	tool:set("Report", 2)                 -- Never
 	local report, out = tool:process(meta(), 1)
 	check("Never stays silent", report == nil, report)
-	check("but still corrects", out.gains[1] ~= nil)
+	check("but still corrects", appliedGain(out) ~= nil)
+end
+
+tap.section("Generate Report")
+do
+	local TMP = "test/tmp"
+	os.execute("rm -rf " .. TMP)
+
+	local function readFile(path)
+		local f = io.open(path, "r")
+		if not f then return nil end
+		local s = f:read("*a")
+		f:close()
+		return s
+	end
+
+	local tool = newTool()
+	tool:set("ReportDir", TMP .. "/reports")
+	tool:press("GenerateReport")
+	tool:process(meta(), 7)
+
+	local written = readFile(TMP .. "/reports/aperture-normalize-A067_08211340_C007-7.txt")
+	check("writes a file named for the clip and frame", written ~= nil)
+	check("records the settings", contains(written, "target aperture        : f4"), written)
+	check("records the outcome", contains(written, "correction : -0.3853 stops"), written)
+	check("dumps the metadata", contains(written, "lens_type = " .. LENS), written)
+	check("flattens nested metadata", contains(written, "GammaSpace.Gamma = 1"), written)
+
+	-- One press, one report.
+	local before = #tool.printed
+	tool:process(meta(), 8)
+	check("does not keep writing every frame",
+		readFile(TMP .. "/reports/aperture-normalize-A067_08211340_C007-8.txt") == nil)
+
+	-- A skipped frame is worth a report too -- that is when you most want one.
+	local tool2 = newTool()
+	tool2:set("ReportDir", TMP .. "/reports")
+	tool2:press("GenerateReport")
+	tool2:process(meta({ lens_type = "Sigma 18-35mm f/1.8 DC HSM" }), 9)
+	local skipped = readFile(TMP .. "/reports/aperture-normalize-A067_08211340_C007-9.txt")
+	check("reports a pass-through and why", contains(skipped, "passed through, because"), skipped)
+
+	-- No folder set is a mistake worth naming.
+	local tool3 = newTool()
+	tool3:press("GenerateReport")
+	local report = tool3:process(meta(), 1)
+	check("asks for a folder when none is set",
+		contains(tool3.printed[#tool3.printed], "set a Report Folder first"),
+		tool3.printed[#tool3.printed])
+
+	os.execute("rm -rf " .. TMP)
 end
 
 tap.finish()

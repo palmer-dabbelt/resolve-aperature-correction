@@ -18,7 +18,8 @@ This tool is meant to be safe to leave enabled on every clip. Anything it does
 not positively understand is passed straight through, untouched and uncopied:
 footage with no metadata, a lens that isn't in the database below, an aperture
 it can't parse or that the lens couldn't have produced, or an image that isn't
-in linear light. It says which of those happened in the Console.
+in linear light. It says which of those happened in the Console, and the
+Generate Report button writes the whole story to a file.
 --]]--
 
 FuRegisterClass("ApertureNormalize", CT_Tool, {
@@ -40,7 +41,8 @@ FuRegisterClass("ApertureNormalize", CT_Tool, {
 -- Keyed by the "lens_type" metadata string. Lookup collapses whitespace and
 -- ignores case, but is otherwise exact -- a lens that isn't listed here gets
 -- passed through untouched, which is the entire point of the table: it is what
--- makes this filter safe to enable on every clip in a timeline.
+-- makes this filter safe to enable on every clip in a timeline. The Force On
+-- Unknown Lenses control overrides that when you know better.
 --
 -- Per-lens fields:
 --
@@ -68,6 +70,14 @@ local LENSES = {
 -- metadata is wrong, and quietly blowing out a shot is worse than doing
 -- nothing.
 local MAX_STOPS = 3.0
+
+-- Below this, pass the frame through instead of correcting it. A thousandth of
+-- a stop is invisible, and skipping the correction skips a full-frame read and
+-- write -- which matters, because a 6K frame is a few hundred megabytes and
+-- cameras sit exactly on a marked aperture most of the time.
+local NEGLIGIBLE_STOPS = 0.001
+
+local MAX_DEPTH = 8
 
 local function lensKey(s)
 	s = tostring(s):lower()
@@ -114,10 +124,9 @@ local function interpolateStops(tbl, n)
 	return 0
 end
 
--- Decides what to do with a frame. Returns a table describing the outcome:
--- either { skip = "reason" } or { stops = .., gain = .., ... }. Kept separate
--- from Process so it can be tested without a Fusion host.
-local function plan(meta, target)
+-- Decides what to do with a frame. Returns either { skip = "reason" } or a
+-- correction. Kept free of Fusion types so it can be tested without a host.
+local function plan(meta, target, force)
 	if type(meta) ~= "table" then
 		return { skip = "the image carries no metadata" }
 	end
@@ -127,24 +136,27 @@ local function plan(meta, target)
 	end
 
 	local lensName = meta.lens_type
-	if lensName == nil or tostring(lensName) == "" then
-		return { skip = "the metadata has no lens_type" }
-	end
+	local haveName = lensName ~= nil and tostring(lensName) ~= ""
+	local entry = haveName and LENSES_BY_KEY[lensKey(lensName)] or nil
 
-	local entry = LENSES_BY_KEY[lensKey(lensName)]
-	if not entry then
+	if not entry and not force then
+		if not haveName then
+			return { skip = "the metadata has no lens_type" }
+		end
 		return { skip = 'lens "' .. tostring(lensName) .. '" is not in the lens database' }
 	end
 
 	local aperture = parseAperture(meta.aperture)
 	if not aperture then
+		-- Forcing can stand in for a missing lens database entry, but not for
+		-- a missing aperture: there is nothing to compute a correction from.
 		if meta.aperture == nil then
 			return { skip = "the metadata has no aperture" }
 		end
 		return { skip = 'cannot read the aperture "' .. tostring(meta.aperture) .. '"' }
 	end
 
-	local range = entry.lens.aperture_range
+	local range = entry and entry.lens.aperture_range
 	if range and (aperture < range[1] or aperture > range[2]) then
 		return { skip = string.format("f%s is outside the f%s-f%s this lens can do",
 			tostring(aperture), tostring(range[1]), tostring(range[2])) }
@@ -153,7 +165,8 @@ local function plan(meta, target)
 	-- A gain is only meaningful on linear light. Fusion reports the encoding
 	-- in GammaSpace.Gamma, and for BRAW through a colour-managed comp it is 1.
 	-- Anything else would need linearising first, which is a different job, so
-	-- say so rather than silently applying a wrong correction.
+	-- say so rather than silently applying a wrong correction. Forcing does not
+	-- override this -- it is about unknown lenses, not wrong maths.
 	local gammaSpace = meta.GammaSpace
 	if type(gammaSpace) == "table" and gammaSpace.Gamma ~= nil then
 		local gamma = tonumber(gammaSpace.Gamma)
@@ -162,14 +175,22 @@ local function plan(meta, target)
 		end
 	end
 
-	local stops = 2 * log2(aperture / target) + interpolateStops(entry.lens.stops, aperture)
+	local stops = 2 * log2(aperture / target)
+	if entry then
+		stops = stops + interpolateStops(entry.lens.stops, aperture)
+	end
 
 	if math.abs(stops) > MAX_STOPS then
 		return { skip = string.format("a %.2f stop correction is too large to be believable", stops) }
 	end
 
+	if math.abs(stops) < NEGLIGIBLE_STOPS then
+		return { skip = string.format("already at the target aperture (f%s)", tostring(aperture)) }
+	end
+
 	return {
-		lens = entry.name,
+		lens = entry and entry.name or (haveName and tostring(lensName) or "unidentified lens"),
+		forced = entry == nil,
 		aperture = aperture,
 		target = target,
 		stops = stops,
@@ -192,7 +213,8 @@ local function buildReport(frame, decision)
 	if decision.skip then
 		out[#out + 1] = "  passing through: " .. decision.skip
 	else
-		out[#out + 1] = "  lens       : " .. decision.lens
+		out[#out + 1] = "  lens       : " .. decision.lens ..
+			(decision.forced and "  (forced, not in the lens database)" or "")
 		out[#out + 1] = string.format("  aperture   : f%s -> target f%s",
 			tostring(decision.aperture), tostring(decision.target))
 		out[#out + 1] = string.format("  correction : %+.3f stops (gain %.4f)",
@@ -209,11 +231,70 @@ local function signature(decision)
 	if decision.skip then
 		return "skip:" .. decision.skip
 	end
-	return string.format("%s|%s|%s", decision.lens, tostring(decision.aperture), tostring(decision.target))
+	return string.format("%s|%s|%s|%s", decision.lens, tostring(decision.aperture),
+		tostring(decision.target), tostring(decision.forced))
 end
 
--- Record what was done in the output metadata, so a downstream Aperture Probe
--- (or its CSV dump) shows the correction alongside the values it came from.
+-- ---------------------------------------------------------------------------
+-- Deciding once per distinct set of inputs
+-- ---------------------------------------------------------------------------
+--
+-- Playback asks for a decision every frame, but the inputs it depends on --
+-- the lens, the aperture, the encoding, the controls -- change only every
+-- several frames at most, and not at all on a static shot. Recomputing means
+-- string matching and formatting for nothing, so keep the last answer.
+--
+-- The cache is a single table replaced wholesale rather than a set of fields
+-- mutated in place: Process runs on several threads, and reading a half
+-- updated cache would pair one frame's aperture with another's correction.
+
+local cached = nil
+
+local function decide(meta, target, force)
+	local isTable = type(meta) == "table"
+	local lensRaw = isTable and meta.lens_type or nil
+	local apertureRaw = isTable and meta.aperture or nil
+	local gammaRaw = nil
+	if isTable and type(meta.GammaSpace) == "table" then
+		gammaRaw = meta.GammaSpace.Gamma
+	end
+
+	local c = cached
+	if c and c.isTable == isTable and c.lens == lensRaw and c.aperture == apertureRaw
+		and c.gamma == gammaRaw and c.target == target and c.force == force then
+		return c.decision
+	end
+
+	local decision = plan(meta, target, force)
+	decision.sig = signature(decision)
+
+	-- Precomputed here rather than per frame: it depends only on the decision.
+	if not decision.skip then
+		decision.stampValues = {
+			gain = string.format("%.6f", decision.gain),
+			stops = string.format("%.4f", decision.stops),
+			from = string.format("f%s", tostring(decision.aperture)),
+			target = string.format("f%s", tostring(decision.target)),
+			lens = decision.lens,
+			forced = decision.forced and "1" or "0",
+		}
+	end
+
+	cached = {
+		isTable = isTable,
+		lens = lensRaw,
+		aperture = apertureRaw,
+		gamma = gammaRaw,
+		target = target,
+		force = force,
+		decision = decision,
+	}
+
+	return decision
+end
+
+-- Record what was done in the output metadata, so a downstream tool shows the
+-- correction alongside the values it came from.
 local function stamp(img, decision)
 	local meta = {}
 	if type(img.Metadata) == "table" then
@@ -222,18 +303,123 @@ local function stamp(img, decision)
 		for k, v in pairs(img.Metadata) do meta[k] = v end
 	end
 
-	meta.aperture_normalize = {
-		gain = string.format("%.6f", decision.gain),
-		stops = string.format("%.4f", decision.stops),
-		from = string.format("f%s", tostring(decision.aperture)),
-		target = string.format("f%s", tostring(decision.target)),
-		lens = decision.lens,
-	}
-
+	meta.aperture_normalize = decision.stampValues
 	img.Metadata = meta
 end
 
+-- ---------------------------------------------------------------------------
+-- Generate Report
+-- ---------------------------------------------------------------------------
+
+-- Walks nested metadata into dotted paths, guarding against cycles and runaway
+-- nesting because this is data we did not create.
+local function flatten(tbl, prefix, out, seen, depth)
+	if depth > MAX_DEPTH then
+		out[#out + 1] = prefix .. "* = <nested deeper than " .. MAX_DEPTH .. " levels>"
+		return out
+	end
+
+	seen[tbl] = true
+
+	local keys = {}
+	for k in pairs(tbl) do keys[#keys + 1] = k end
+	table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+
+	for _, k in ipairs(keys) do
+		local v = tbl[k]
+		local path = prefix .. tostring(k)
+
+		if type(v) ~= "table" then
+			out[#out + 1] = path .. " = " .. tostring(v)
+		elseif seen[v] then
+			out[#out + 1] = path .. " = <circular reference>"
+		elseif next(v) == nil then
+			out[#out + 1] = path .. " = <empty table>"
+		else
+			flatten(v, path .. ".", out, seen, depth + 1)
+		end
+	end
+
+	seen[tbl] = nil
+	return out
+end
+
+local function clipName(meta)
+	if type(meta) == "table" and meta.Filename then
+		local base = tostring(meta.Filename):match("([^/\\]+)$")
+		if base then
+			base = base:gsub("%.[^.]+$", "")
+			base = base:gsub("[^%w%-_.]", "_")
+			if base ~= "" then return base end
+		end
+	end
+	return "clip"
+end
+
+local function timestamp()
+	local ok, stamped = pcall(os.date, "%Y-%m-%d %H:%M:%S")
+	if ok and stamped then return tostring(stamped) end
+	return "unknown"
+end
+
+local function writeReport(dir, frame, meta, decision, target, force)
+	local path = string.format("%s/aperture-normalize-%s-%s.txt", dir, clipName(meta), tostring(frame))
+
+	local out = {}
+	out[#out + 1] = "Aperture Normalize report"
+	out[#out + 1] = "generated : " .. timestamp()
+	out[#out + 1] = "tool      : " .. toolName()
+	out[#out + 1] = "frame     : " .. tostring(frame)
+	out[#out + 1] = ""
+	out[#out + 1] = "settings"
+	out[#out + 1] = "  target aperture        : f" .. tostring(target)
+	out[#out + 1] = "  force on unknown lenses: " .. (force and "yes" or "no")
+	out[#out + 1] = ""
+	out[#out + 1] = "outcome"
+	if decision.skip then
+		out[#out + 1] = "  passed through, because " .. decision.skip
+	else
+		out[#out + 1] = "  lens       : " .. decision.lens ..
+			(decision.forced and "  (forced, not in the lens database)" or "")
+		out[#out + 1] = string.format("  aperture   : f%s -> target f%s",
+			tostring(decision.aperture), tostring(decision.target))
+		out[#out + 1] = string.format("  correction : %+.4f stops (gain %.6f)",
+			decision.stops, decision.gain)
+	end
+	out[#out + 1] = ""
+	out[#out + 1] = "metadata"
+
+	if type(meta) == "table" then
+		local fields = flatten(meta, "", {}, {}, 1)
+		if #fields == 0 then
+			out[#out + 1] = "  (present but empty)"
+		else
+			for _, line in ipairs(fields) do
+				out[#out + 1] = "  " .. line
+			end
+		end
+	else
+		out[#out + 1] = "  (none: Image.Metadata is nil)"
+	end
+
+	-- Lua has no mkdir, and a missing directory is the likeliest reason this
+	-- fails, so take one shot at creating it before giving up.
+	pcall(function() os.execute('mkdir -p "' .. dir .. '"') end)
+
+	local f, err = io.open(path, "w")
+	if not f then
+		print("-- Aperture Normalize: cannot write " .. path .. "\n   " .. tostring(err) ..
+		      "\n   A sandboxed Resolve may be refused paths outside its container.")
+		return
+	end
+	f:write(table.concat(out, "\n") .. "\n")
+	f:close()
+
+	print("-- Aperture Normalize: wrote " .. path)
+end
+
 local lastSignature = nil
+local reportPending = false
 
 function Create()
 	InImage = self:AddInput("Input", "Input", {
@@ -256,6 +442,13 @@ function Create()
 		INP_MaxAllowed = 64.0,
 	})
 
+	InForce = self:AddInput("Force On Unknown Lenses", "Force", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "CheckboxControl",
+		INP_Integer = true,
+		INP_Default = 0.0,
+	})
+
 	InWhen = self:AddInput("Report", "Report", {
 		LINKID_DataType = "Number",
 		INPID_InputControl = "ComboControl",
@@ -266,18 +459,55 @@ function Create()
 		{ CCS_AddString = "Never", },
 		CC_LabelPosition = "Vertical",
 	})
+
+	InReportDir = self:AddInput("Report Folder", "ReportDir", {
+		LINKID_DataType = "Text",
+		INPID_InputControl = "FileControl",
+		INPS_DefaultText = "",
+		FC_PathBrowse = true,
+		FC_IsSaver = true,
+	})
+
+	InGenerate = self:AddInput("Generate Report", "GenerateReport", {
+		LINKID_DataType = "Text",
+		INPID_InputControl = "ButtonControl",
+		INP_DoNotifyChanged = true,
+		INP_External = false,
+	})
+end
+
+function NotifyChanged(inp, param, time)
+	if inp == InGenerate then
+		-- NotifyChanged has no image to look at, so leave a note for the
+		-- render that the button click is about to trigger.
+		reportPending = true
+	end
 end
 
 function Process(req)
 	local img = InImage:GetValue(req)
-	local decision = plan(img.Metadata, InTarget:GetValue(req).Value)
+	local meta = img.Metadata
+
+	local target = InTarget:GetValue(req).Value
+	local force = InForce:GetValue(req).Value > 0.5
+
+	local decision = decide(meta, target, force)
 
 	local when = InWhen:GetValue(req).Value
 	if when ~= 2 then
-		local sig = signature(decision)
-		if when == 1 or sig ~= lastSignature then
-			lastSignature = sig
+		if when == 1 or decision.sig ~= lastSignature then
+			lastSignature = decision.sig
 			print(buildReport(req:GetTime(), decision))
+		end
+	end
+
+	if reportPending then
+		reportPending = false
+		local dir = InReportDir:GetValue(req).Value or ""
+		if dir == "" then
+			print("-- Aperture Normalize: set a Report Folder first")
+		else
+			writeReport(dir, req:GetTime(), meta, decision, target, force)
 		end
 	end
 
@@ -288,9 +518,13 @@ function Process(req)
 		return
 	end
 
-	local out = img:CopyOf()
-	-- Alpha is coverage, not light, so it is deliberately left alone.
-	out:Gain(decision.gain, decision.gain, decision.gain, 1.0)
+	-- One pass over the frame. CopyOf followed by Gain would read and write
+	-- the whole image twice, and a 6K frame is a few hundred megabytes; a
+	-- multiplying ChannelOpOf returns the new image directly. Alpha is left
+	-- out of the options table, which leaves that plane untouched -- it is
+	-- coverage, not light.
+	local gain = decision.gain
+	local out = img:ChannelOpOf("Multiply", nil, { R = gain, G = gain, B = gain })
 	stamp(out, decision)
 
 	OutImage:Set(req, out)
