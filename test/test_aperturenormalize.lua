@@ -424,6 +424,113 @@ do
 		contains(report, "zoom       : 10mm"), report)
 end
 
+tap.section("the reported aperture is quantised, the lens is not")
+do
+	-- The camera keeps saying f/3.5 out to 12mm, but the lens has ramped to
+	-- f/3.7 by then and the frame is correspondingly darker. The database
+	-- knows that; the metadata doesn't.
+	local tool = newTool()
+	local report, out = tool:process(meta({ focal_length = "12mm" }), 1)
+
+	check("corrects from what the lens can actually do",
+		near(appliedGain(out), (3.7 / 4) ^ 2), appliedGain(out))
+	check("not from the f-number the camera reported",
+		not near(appliedGain(out), (3.5 / 4) ^ 2))
+	check("shows the aperture it used", contains(report, "aperture   : f3.7 -> target f4"), report)
+	check("and says the camera disagreed", contains(report, "f3.5 reported"), report)
+	check("naming the zoom position that settles it", contains(report, "only opens to f3.7 at 12mm"),
+		report)
+end
+
+do
+	-- Only the entries at 10, 11, 12, 13, 15 and 17mm were observed; the rest
+	-- of the ramp is filled in between them.
+	local tool = newTool()
+	local _, out = tool:process(meta({ focal_length = "14mm" }), 1)
+	check("interpolates between the measured positions",
+		near(appliedGain(out), (3.9 / 4) ^ 2), appliedGain(out))
+
+	local _, out2 = tool:process(meta({ focal_length = "16mm" }), 2)
+	check("and again further along", near(appliedGain(out2), (4.1 / 4) ^ 2), appliedGain(out2))
+end
+
+do
+	-- Past the end of the table the widest aperture is held flat rather than
+	-- extrapolated, which is what the lens does too once it is wide open.
+	local tool = newTool()
+	local _, out = tool:process(meta({ focal_length = "22mm" }), 1)
+	check("holds at the long end", near(appliedGain(out), (4.5 / 4) ^ 2), appliedGain(out))
+
+	local _, out2 = tool:process(meta({ focal_length = "30mm" }), 2)
+	check("and does not extrapolate past it", near(appliedGain(out2), (4.5 / 4) ^ 2), appliedGain(out2))
+end
+
+do
+	-- At the wide end the metadata is already right, so nothing is overruled
+	-- and the report has nothing extra to say.
+	local tool = newTool()
+	local report, out = tool:process(meta({ focal_length = "10mm" }), 1)
+	check("leaves the wide end alone", near(appliedGain(out), 0.765625), appliedGain(out))
+	check("and says nothing about it", not contains(report, "wide open"), report)
+end
+
+do
+	-- The table is a floor on the f-number, not a replacement for it: stopped
+	-- down, the reported aperture is reachable and therefore believed.
+	local tool = newTool()
+	local report, out = tool:process(meta({ focal_length = "12mm", aperture = "f8" }), 1)
+	check("a stopped-down frame is corrected from its own aperture",
+		near(appliedGain(out), (8 / 4) ^ 2), appliedGain(out))
+	check("with nothing overruled", not contains(report, "reported"), report)
+end
+
+do
+	-- Zooming at a constant reported aperture changes the correction, which is
+	-- the entire point -- and the cache has to notice.
+	local tool = newTool()
+	local _, out = tool:process(meta({ focal_length = "11mm" }), 1)
+	check("zoom alone moves the correction", near(appliedGain(out), (3.6 / 4) ^ 2), appliedGain(out))
+
+	local _, out2 = tool:process(meta({ focal_length = "13mm" }), 2)
+	check("and moves it again", near(appliedGain(out2), (3.8 / 4) ^ 2), appliedGain(out2))
+end
+
+do
+	-- No focal length is no lookup; fall back to what the camera said.
+	local tool = newTool()
+	local _, out = tool:process(meta({ focal_length = "<nil>" }), 1)
+	check("without a focal length the reported aperture stands",
+		near(appliedGain(out), 0.765625), appliedGain(out))
+end
+
+do
+	-- A forced lens has no table to consult, so forcing cannot invent one.
+	local tool = newTool()
+	tool:set("Force", 1)
+	local _, out = tool:process(meta({
+		lens_type = "Sigma 18-35mm f/1.8 DC HSM", focal_length = "12mm" }), 1)
+	check("an unlisted lens is corrected from its metadata alone",
+		near(appliedGain(out), 0.765625), appliedGain(out))
+end
+
+do
+	-- Both f-numbers reach the stamp, so a downstream tool can see that they
+	-- differed and by how much.
+	local tool = newTool()
+	local _, out = tool:process(meta({ focal_length = "12mm" }), 1)
+	local stamped = out.Metadata.aperture_normalize
+	check("stamps the aperture it corrected from", stamped and stamped.from == "f3.7",
+		stamped and stamped.from)
+	check("and the one the camera reported", stamped and stamped.reported == "f3.5",
+		stamped and stamped.reported)
+
+	local tool2 = newTool()
+	local _, out2 = tool2:process(meta(), 1)
+	check("and leaves it out when they agree",
+		out2.Metadata.aperture_normalize.reported == nil,
+		out2.Metadata.aperture_normalize.reported)
+end
+
 tap.section("Generate Report")
 do
 	local TMP = "test/tmp"

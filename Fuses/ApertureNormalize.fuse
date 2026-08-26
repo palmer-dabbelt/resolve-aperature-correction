@@ -14,6 +14,13 @@ Illuminance at the sensor goes as 1/N^2 for an f-number N, so matching a frame
 shot at N to what it would have been at the target aperture is a gain of
 (N / target)^2 -- a pure multiply, applied in linear light.
 
+What the camera records, though, is rounded to a marked stop, and the lens
+ramps continuously between them: it will report f/3.5 at a zoom position where
+the glass has already closed to f/3.7, and the frame is a fraction of a stop
+darker than the metadata accounts for. So where the lens database knows how
+wide the lens actually opens at a given focal length, that -- not the reported
+f-number -- is what the correction is computed from.
+
 This tool is meant to be safe to leave enabled on every clip. Anything it does
 not positively understand is passed straight through, untouched and uncopied:
 footage with no metadata, a lens that isn't in the database below, an aperture
@@ -50,6 +57,20 @@ FuRegisterClass("ApertureNormalize", CT_Tool, {
 --                   this couldn't have come from this lens, so it is treated
 --                   as bad metadata and the frame is passed through.
 --
+--   max_aperture    Optional {[focal_length_mm] = widest_f_number}: how far
+--                   the lens actually opens at a given zoom position, linearly
+--                   interpolated between the entries and held flat outside
+--                   them. A variable-aperture zoom ramps smoothly as it is
+--                   zoomed, but the camera records the ramp quantised to
+--                   marked stops, so wide open it under-reports -- it will say
+--                   f/3.5 at a zoom position where the lens can only manage
+--                   f/3.7, and the frame is darker than the metadata claims.
+--                   Where this table says the reported aperture is wider than
+--                   the lens can physically reach, the table wins: the
+--                   metadata is rounded, the glass is not. It can only ever
+--                   take effect on a reported value that was impossible to
+--                   begin with, so it leaves a stopped-down frame alone.
+--
 --   stops           Optional {[f_number] = correction_in_stops}. The inverse
 --                   square law assumes the marked f-number equals the actual
 --                   transmission, which real glass only approximates; this is
@@ -61,6 +82,29 @@ FuRegisterClass("ApertureNormalize", CT_Tool, {
 local LENSES = {
 	["Canon EF-S 10-22mm f/3.5-4.5 USM"] = {
 		aperture_range = { 3.5, 29 },
+
+		-- Observed on one copy of this lens: it reports f/3.5 from 10mm to
+		-- 12mm while visibly dimming across that span, then steps to f/3.8 at
+		-- 13mm, f/4.0 at 15mm and f/4.2 at 17mm. Read as a ramp rather than as
+		-- steps, that is a tenth of a stop-marking per millimetre, which is
+		-- what the entries below say.
+		--
+		-- 10 to 13, 15 and 17 are where the reported value was actually seen
+		-- to change. 20 and 22 are a guess: the same tenth per millimetre
+		-- continued until it reaches the f/4.5 the lens is sold as, then flat
+		-- to the long end. Nothing past 17mm has been checked, so that is the
+		-- part to revisit first.
+		max_aperture = {
+			[10] = 3.5,
+			[11] = 3.6,
+			[12] = 3.7,
+			[13] = 3.8,
+			[15] = 4.0,   -- 14mm interpolates to f/3.9
+			[17] = 4.2,   -- 16mm to f/4.1
+			[20] = 4.5,   -- guessed; 18mm and 19mm to f/4.3 and f/4.4
+			[22] = 4.5,   -- guessed: it can't keep ramping once it is there
+		},
+
 		stops = nil,
 	},
 }
@@ -111,25 +155,39 @@ local function parseFocal(s)
 	return tonumber(tostring(s):match("(%d+%.?%d*)"))
 end
 
-local function interpolateStops(tbl, n)
-	if type(tbl) ~= "table" then return 0 end
+-- An f-number for display. What comes out of the tables is often interpolated
+-- between two of the marked stops, and full float precision on a quantity the
+-- glass only approximates to begin with is noise, not information.
+local function fnum(n)
+	if type(n) ~= "number" then return tostring(n) end
+	local s = string.format("%.2f", n)
+	return (s:gsub("0+$", ""):gsub("%.$", ""))
+end
+
+-- Reads a curve stored as {[x] = y}: linear between the points given, flat
+-- beyond the ends, nil if there is no curve or nothing to look up with. Both
+-- of the per-lens tables are this shape -- one keyed by f-number, one by focal
+-- length -- and both want the same treatment of the gaps.
+local function interpolate(tbl, x)
+	if type(tbl) ~= "table" or type(x) ~= "number" then return nil end
 
 	local keys = {}
 	for k in pairs(tbl) do keys[#keys + 1] = k end
-	if #keys == 0 then return 0 end
+	if #keys == 0 then return nil end
 	table.sort(keys)
 
-	if n <= keys[1] then return tbl[keys[1]] end
-	if n >= keys[#keys] then return tbl[keys[#keys]] end
+	if tbl[x] then return tbl[x] end
+	if x <= keys[1] then return tbl[keys[1]] end
+	if x >= keys[#keys] then return tbl[keys[#keys]] end
 
 	for i = 1, #keys - 1 do
 		local a, b = keys[i], keys[i + 1]
-		if n >= a and n <= b then
-			return tbl[a] + (tbl[b] - tbl[a]) * ((n - a) / (b - a))
+		if x >= a and x <= b then
+			return tbl[a] + (tbl[b] - tbl[a]) * ((x - a) / (b - a))
 		end
 	end
 
-	return 0
+	return nil
 end
 
 -- Decides what to do with a frame. Returns either { skip = "reason" } or a
@@ -167,7 +225,7 @@ local function plan(meta, target, force)
 	local range = entry and entry.lens.aperture_range
 	if range and (aperture < range[1] or aperture > range[2]) then
 		return { skip = string.format("f%s is outside the f%s-f%s this lens can do",
-			tostring(aperture), tostring(range[1]), tostring(range[2])) }
+			fnum(aperture), fnum(range[1]), fnum(range[2])) }
 	end
 
 	-- A gain is only meaningful on linear light. Fusion reports the encoding
@@ -183,9 +241,22 @@ local function plan(meta, target, force)
 		end
 	end
 
+	-- The reported aperture is rounded to a marked stop, and a variable
+	-- aperture zoom spends most of its life wide open, where the rounding is
+	-- all in one direction: the camera keeps saying f/3.5 while the lens has
+	-- already ramped past it. Where the lens database knows the widest
+	-- aperture available at this zoom position, and the metadata claims one
+	-- wider than that, believe the lens.
+	local reported = nil
+	local focalMm = parseFocal(meta.focal_length)
+	local widest = entry and interpolate(entry.lens.max_aperture, focalMm)
+	if widest and aperture < widest then
+		reported, aperture = aperture, widest
+	end
+
 	local stops = 2 * log2(aperture / target)
 	if entry then
-		stops = stops + interpolateStops(entry.lens.stops, aperture)
+		stops = stops + (interpolate(entry.lens.stops, aperture) or 0)
 	end
 
 	if math.abs(stops) > MAX_STOPS then
@@ -193,13 +264,14 @@ local function plan(meta, target, force)
 	end
 
 	if math.abs(stops) < NEGLIGIBLE_STOPS then
-		return { skip = string.format("already at the target aperture (f%s)", tostring(aperture)) }
+		return { skip = string.format("already at the target aperture (f%s)", fnum(aperture)) }
 	end
 
 	return {
 		lens = entry and entry.name or (haveName and tostring(lensName) or "unidentified lens"),
 		forced = entry == nil,
 		aperture = aperture,
+		reported = reported,
 		target = target,
 		stops = stops,
 		gain = 2 ^ stops,
@@ -226,6 +298,15 @@ local function zoomLine(decision)
 	return line
 end
 
+-- Said whenever the lens database overruled the camera, because a report that
+-- shows a correction from an f-number the metadata never contained is a
+-- confusing thing to read otherwise.
+local function wideOpenLine(decision)
+	if not decision.reported then return nil end
+	return string.format("  wide open  : f%s reported, but this lens only opens to f%s at %s",
+		fnum(decision.reported), fnum(decision.aperture), tostring(decision.focal))
+end
+
 local function buildReport(frame, decision)
 	local out = {}
 	out[#out + 1] = "-- Aperture Normalize [" .. toolName() .. "] frame " .. tostring(frame) .. " --"
@@ -236,7 +317,9 @@ local function buildReport(frame, decision)
 		out[#out + 1] = "  lens       : " .. decision.lens ..
 			(decision.forced and "  (forced, not in the lens database)" or "")
 		out[#out + 1] = string.format("  aperture   : f%s -> target f%s",
-			tostring(decision.aperture), tostring(decision.target))
+			fnum(decision.aperture), fnum(decision.target))
+		local wide = wideOpenLine(decision)
+		if wide then out[#out + 1] = wide end
 		out[#out + 1] = string.format("  correction : %+.3f stops (gain %.4f)",
 			decision.stops, decision.gain)
 	end
@@ -255,8 +338,8 @@ local function signature(decision)
 	if decision.skip then
 		return "skip:" .. decision.skip .. "|" .. zoom
 	end
-	return string.format("%s|%s|%s|%s|%s", decision.lens, tostring(decision.aperture),
-		tostring(decision.target), tostring(decision.forced), zoom)
+	return string.format("%s|%s|%s|%s|%s|%s", decision.lens, tostring(decision.aperture),
+		tostring(decision.reported), tostring(decision.target), tostring(decision.forced), zoom)
 end
 
 -- ---------------------------------------------------------------------------
@@ -303,8 +386,11 @@ local function decide(meta, target, force)
 		decision.stampValues = {
 			gain = string.format("%.6f", decision.gain),
 			stops = string.format("%.4f", decision.stops),
-			from = string.format("f%s", tostring(decision.aperture)),
-			target = string.format("f%s", tostring(decision.target)),
+			from = string.format("f%s", fnum(decision.aperture)),
+			-- Only present when the two disagree, so its absence means the
+			-- correction came from exactly what the camera recorded.
+			reported = decision.reported and string.format("f%s", fnum(decision.reported)) or nil,
+			target = string.format("f%s", fnum(decision.target)),
 			lens = decision.lens,
 			forced = decision.forced and "1" or "0",
 			focal = focalRaw and tostring(focalRaw) or nil,
@@ -406,7 +492,7 @@ local function writeReport(dir, frame, meta, decision, target, force)
 	out[#out + 1] = "frame     : " .. tostring(frame)
 	out[#out + 1] = ""
 	out[#out + 1] = "settings"
-	out[#out + 1] = "  target aperture        : f" .. tostring(target)
+	out[#out + 1] = "  target aperture        : f" .. fnum(target)
 	out[#out + 1] = "  force on unknown lenses: " .. (force and "yes" or "no")
 	out[#out + 1] = ""
 	out[#out + 1] = "outcome"
@@ -416,7 +502,9 @@ local function writeReport(dir, frame, meta, decision, target, force)
 		out[#out + 1] = "  lens       : " .. decision.lens ..
 			(decision.forced and "  (forced, not in the lens database)" or "")
 		out[#out + 1] = string.format("  aperture   : f%s -> target f%s",
-			tostring(decision.aperture), tostring(decision.target))
+			fnum(decision.aperture), fnum(decision.target))
+		local wide = wideOpenLine(decision)
+		if wide then out[#out + 1] = wide end
 		out[#out + 1] = string.format("  correction : %+.4f stops (gain %.6f)",
 			decision.stops, decision.gain)
 	end

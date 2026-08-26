@@ -55,8 +55,9 @@ lenses you know are fine, not about overriding arithmetic.
 
 When it *does* correct, it stamps
 `aperture_normalize.{gain,stops,from,target,lens,forced,focal,distance}` into
-the output metadata, so a tool placed downstream shows the correction next to
-the values it came from.
+the output metadata — plus `reported`, on the frames where the camera's
+f-number was [overruled](#the-lens-lies-about-being-wide-open) — so a tool
+placed downstream shows the correction next to the values it came from.
 
 | Control | What it does |
 | --- | --- |
@@ -101,9 +102,40 @@ output usable for deriving a correction curve. It is reported on frames that
 are *passed through* too, since those are part of the same curve. That is a lot
 more lines than before, hence **Console Logging** as a master switch.
 
-The lens database's `stops` table is still keyed by f-number. Keying a
-correction on focal length instead is the obvious next step, once there is
-measured data to key it on.
+#### The lens lies about being wide open
+
+That quantisation isn't just coarse, it's biased. Watch the Canon 10-22 zoom in
+from the wide end and it reports f/3.5 at 10mm, f/3.5 at 12mm — and the 12mm
+frame is visibly darker. The aperture has been ramping the whole way; the
+camera only tells you about it when the ramp crosses the next marked stop, so
+wide open the reported f-number is always the same or too wide, never too
+narrow. Correcting from it under-corrects exactly where the correction is
+needed.
+
+The fix is a second per-lens table, `max_aperture`, keyed by focal length:
+how wide the lens will actually open at each zoom position. Where it says the
+reported aperture is wider than the lens can physically reach, the table wins.
+
+```
+-- Aperture Normalize [ApertureNormalize1] frame 5931 --
+  lens       : Canon EF-S 10-22mm f/3.5-4.5 USM
+  aperture   : f3.7 -> target f4
+  wide open  : f3.5 reported, but this lens only opens to f3.7 at 12mm
+  correction : -0.225 stops (gain 0.8556)
+  zoom       : 12mm  (focus 2240mm to 6480mm)
+```
+
+It's a floor on the f-number rather than a replacement for it, which is what
+makes it safe: it can only ever fire on a reported value that was impossible to
+begin with. Stopped down to f/8 at 12mm, f/8 is perfectly reachable, so the
+metadata is believed and nothing changes. It also does nothing without a
+`focal_length`, and nothing for a lens that has no table — including a forced
+one, since forcing supplies permission, not data.
+
+When it does fire, both f-numbers are recorded: the report gets the `wide open`
+line above, and the metadata stamp gets `reported` alongside `from`. A stamp
+with no `reported` field means the correction came from exactly what the camera
+said.
 
 #### Performance
 
@@ -180,6 +212,10 @@ Near the top of `Fuses/ApertureNormalize.fuse`:
 local LENSES = {
 	["Canon EF-S 10-22mm f/3.5-4.5 USM"] = {
 		aperture_range = { 3.5, 29 },
+		max_aperture = {
+			[10] = 3.5, [11] = 3.6, [12] = 3.7, [13] = 3.8,
+			[15] = 4.0, [17] = 4.2, [20] = 4.5, [22] = 4.5,
+		},
 		stops = nil,
 	},
 }
@@ -193,12 +229,28 @@ that's what makes the filter safe to apply globally.
 An aperture outside it is treated as bad metadata rather than as a very large
 correction.
 
+`max_aperture` is the widest aperture available at each zoom position, keyed by
+focal length in millimetres, linear between the entries and flat outside them —
+the table behind [the section above](#the-lens-lies-about-being-wide-open).
+The 10-22's entries at 10, 11, 12, 13, 15 and 17mm are where the reported
+f-number was seen to change on one copy of the lens, which works out at a tenth
+of a stop-marking per millimetre. Past 17mm is a guess: that same tenth per
+millimetre continued until it reaches the f/4.5 the lens is sold as, then flat
+to the long end. That's the part to check first if a long-end shot looks
+over-corrected.
+
+Unlike `stops` below, guessing here is defensible, because an inferred ramp
+between two observed points is much closer to the truth than the step function
+the camera reports — and because the floor rule means a wrong entry can only
+affect frames shot at or near wide open.
+
 `stops` is optional and unset so far. The inverse-square law assumes the marked
 f-number equals actual transmission, which real glass only approximates; this
 is where measured deviation goes, as `{[f_number] = correction_in_stops}`,
 interpolated between the points given and added on top of the computed
 correction. Use the Aperture Probe's CSV dump to measure it. It's better to
-leave it nil than to guess.
+leave it nil than to guess: it's a fudge factor applied everywhere, with
+nothing physical to bound it.
 
 ### Aperture Probe
 
