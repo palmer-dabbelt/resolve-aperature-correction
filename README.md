@@ -26,13 +26,13 @@ that, and is still the tool for finding out what a given camera tags.
 
 The correction itself. It reads the aperture the camera recorded for each
 frame, and applies the gain that would have made it look like it was shot at a
-target aperture — f/4 by default, the middle of the 10-22mm's range.
+target aperture — by default the widest the lens opens to, f/3.5 for the
+10-22mm.
 
 Illuminance at the sensor goes as 1/N² for an f-number N, so matching a frame
-shot at N to the target is a gain of `(N / target)²`. At f/3.5 against a f/4
-target that's ×0.766, a third of a stop darker; at f/4.5 it's ×1.266 brighter.
-The gain is applied to R, G and B but not alpha, which is coverage rather than
-light.
+shot at N to the target is a gain of `(N / target)²`. At f/4.5 against a f/3.5
+target that's ×1.653, three quarters of a stop brighter. The gain is applied to
+R, G and B but not alpha, which is coverage rather than light.
 
 **It is meant to be safe to leave enabled on every clip.** Anything it does not
 positively understand is passed through untouched and uncopied, with the reason
@@ -44,14 +44,40 @@ printed once to the Console:
 - the image isn't in linear light (a gain is only meaningful there)
 - the correction works out larger than 3 stops, which means the metadata is
   lying rather than that the shot needs it
-- the correction is smaller than a thousandth of a stop — the frame is already
-  at the target aperture, and that is invisible
 
 **Force On Unknown Lenses** overrides the second of those: an unlisted lens, or
 metadata with no `lens_type` at all, gets corrected from whatever aperture it
 reports. It deliberately does *not* override the rest. Those are cases where
 the maths would be wrong rather than merely unvouched-for, and forcing is about
 lenses you know are fine, not about overriding arithmetic.
+
+#### What it normalises to
+
+By default, the widest aperture the lens has — f/3.5 for the 10-22mm, taken
+from the first half of its `aperture_range`. That is the one target every frame
+of a zoom can actually be brought to, because the ramp only ever runs from
+there towards darker, so every correction brightens and none of them throw
+light away. It also means a clip is matched to its own wide end rather than to
+an f-number picked in advance, and that two different lenses each get taken to
+their own best rather than to a common denominator neither is good at.
+
+```
+  aperture   : f4.5 -> target f3.5  (the widest this lens opens)
+  correction : +0.725 stops (gain 1.6531)
+  zoom       : 22mm
+```
+
+The consequence to know about is that it only ever adds gain, so a long-end
+frame exposed to the top of the range will clip where it previously wouldn't
+have. If that matters, turn **Target The Lens's Widest Aperture** off and set
+**Target Aperture** to the narrow end instead — everything then darkens rather
+than brightens. Turning it off is also how to take several different lenses to
+one common f-number, which the per-lens default deliberately won't do.
+
+A lens that isn't in the database has no widest to aim at, so those fall back
+to the slider even with the control on — including under **Force On Unknown
+Lenses**, which supplies permission rather than data. The report always says
+which of the two was used.
 
 When it *does* correct, it stamps
 `aperture_normalize.{gain,stops,from,target,lens,forced,focal,distance}` into
@@ -61,7 +87,8 @@ placed downstream shows the correction next to the values it came from.
 
 | Control | What it does |
 | --- | --- |
-| Target Aperture | The f-number to normalise to. Default 4. |
+| Target The Lens's Widest Aperture | Normalise to whatever the lens's widest is, ignoring the slider below. On by default. |
+| Target Aperture | The f-number to normalise to when that's off, or when the lens isn't in the database. Default 4. |
 | Force On Unknown Lenses | Correct lenses that aren't in the database. Off by default. |
 | Processing | *GPU (falls back to CPU)* by default; either CPU path, to compare them; or *Off: publish gain only*, which touches no pixels and leaves the multiply to a downstream tool. |
 | Console Logging | Master switch for Console output. On by default. |
@@ -91,8 +118,8 @@ how much light reaches the sensor:
 ```
 -- Aperture Normalize [ApertureNormalize1] frame 5886 --
   lens       : Canon EF-S 10-22mm f/3.5-4.5 USM
-  aperture   : f3.5 -> target f4
-  correction : -0.385 stops (gain 0.7656)
+  aperture   : f4 -> target f3.5  (the widest this lens opens)
+  correction : +0.385 stops (gain 1.3061)
   zoom       : 10mm  (focus 2240mm to 6480mm)
 ```
 
@@ -119,9 +146,9 @@ reported aperture is wider than the lens can physically reach, the table wins.
 ```
 -- Aperture Normalize [ApertureNormalize1] frame 5931 --
   lens       : Canon EF-S 10-22mm f/3.5-4.5 USM
-  aperture   : f3.7 -> target f4
+  aperture   : f3.7 -> target f3.5  (the widest this lens opens)
   wide open  : f3.5 reported, but this lens only opens to f3.7 at 12mm
-  correction : -0.225 stops (gain 0.8556)
+  correction : +0.160 stops (gain 1.1176)
   zoom       : 12mm  (focus 2240mm to 6480mm)
 ```
 
@@ -198,8 +225,12 @@ stale gain from some earlier frame.
 Beyond that:
 
 - Alpha is never touched. It is coverage, not light.
-- A frame needing no correction is passed through by reference, so a clip shot
-  at the target aperture costs nothing at all.
+- A frame whose correction works out to nothing is *not* a special case. It
+  used to be passed through by reference, to save the copy, but the **Gain**
+  output has to publish a number for it either way — and on a zoom ramp the one
+  frame that lands exactly on the target sits between two that don't, so
+  reporting it as a pass-through read as though the tool had stopped working
+  halfway through the shot. It now reports and publishes like any other frame.
 - The decision is recomputed only when something it depends on changes: the
   lens, the aperture, the zoom, the encoding, or a control. On a static shot
   that is once per clip rather than once per frame.

@@ -21,6 +21,12 @@ darker than the metadata accounts for. So where the lens database knows how
 wide the lens actually opens at a given focal length, that -- not the reported
 f-number -- is what the correction is computed from.
 
+What it normalises *to* is, by default, the widest aperture the lens in the
+database has: every frame of a zoom can be brought up to that, since the ramp
+only ever runs from there towards darker, and a clip ends up matching its own
+wide end rather than some f-number picked in advance. Turn that off to aim
+several lenses at one common target instead.
+
 This tool is meant to be safe to leave enabled on every clip. Anything it does
 not positively understand is passed straight through, untouched and uncopied:
 footage with no metadata, a lens that isn't in the database below, an aperture
@@ -115,12 +121,6 @@ local LENSES = {
 -- nothing.
 local MAX_STOPS = 3.0
 
--- Below this, pass the frame through instead of correcting it. A thousandth of
--- a stop is invisible, and skipping the correction skips a full-frame read and
--- write -- which matters, because a 6K frame is a few hundred megabytes and
--- cameras sit exactly on a marked aperture most of the time.
-local NEGLIGIBLE_STOPS = 0.001
-
 local MAX_DEPTH = 8
 
 local function lensKey(s)
@@ -192,13 +192,9 @@ end
 
 -- Decides what to do with a frame. Returns either { skip = "reason" } or a
 -- correction. Kept free of Fusion types so it can be tested without a host.
-local function plan(meta, target, force)
+local function plan(meta, target, force, auto)
 	if type(meta) ~= "table" then
 		return { skip = "the image carries no metadata" }
-	end
-
-	if type(target) ~= "number" or target <= 0 then
-		return { skip = "the target aperture is not a usable f-number" }
 	end
 
 	local lensName = meta.lens_type
@@ -210,6 +206,27 @@ local function plan(meta, target, force)
 			return { skip = "the metadata has no lens_type" }
 		end
 		return { skip = 'lens "' .. tostring(lensName) .. '" is not in the lens database' }
+	end
+
+	-- What to normalise to. Left to itself the tool aims at the widest
+	-- aperture the lens has, which is the one aperture every frame of a zoom
+	-- can be brought to without inventing light the lens never gathered: the
+	-- ramp only ever runs from there towards darker. It also means a clip
+	-- matches its own wide end rather than an arbitrary f-number, and that two
+	-- lenses each get normalised to their own best rather than to a common
+	-- denominator neither of them is particularly good at.
+	--
+	-- An unlisted lens has no widest to aim at -- forcing supplies permission,
+	-- not a database entry -- so those fall back to the Target Aperture
+	-- control, and the report says which of the two was used.
+	local widestOfLens = entry and entry.lens.aperture_range and entry.lens.aperture_range[1]
+	local autoTarget = auto and widestOfLens ~= nil
+	if autoTarget then
+		target = widestOfLens
+	end
+
+	if type(target) ~= "number" or target <= 0 then
+		return { skip = "the target aperture is not a usable f-number" }
 	end
 
 	local aperture = parseAperture(meta.aperture)
@@ -263,9 +280,12 @@ local function plan(meta, target, force)
 		return { skip = string.format("a %.2f stop correction is too large to be believable", stops) }
 	end
 
-	if math.abs(stops) < NEGLIGIBLE_STOPS then
-		return { skip = string.format("already at the target aperture (f%s)", fnum(aperture)) }
-	end
+	-- A correction of zero is not a special case. It used to be -- passing the
+	-- frame through saved a full-frame copy when the shot sat exactly on the
+	-- target -- but the Gain output has to publish a number either way, and
+	-- treating one frame of a smooth zoom ramp as a pass-through because it
+	-- happened to land on the target made the Console read as though the tool
+	-- had stopped working. So it reports and publishes like any other frame.
 
 	return {
 		lens = entry and entry.name or (haveName and tostring(lensName) or "unidentified lens"),
@@ -273,6 +293,7 @@ local function plan(meta, target, force)
 		aperture = aperture,
 		reported = reported,
 		target = target,
+		autoTarget = autoTarget,
 		stops = stops,
 		gain = 2 ^ stops,
 	}
@@ -316,8 +337,9 @@ local function buildReport(frame, decision)
 	else
 		out[#out + 1] = "  lens       : " .. decision.lens ..
 			(decision.forced and "  (forced, not in the lens database)" or "")
-		out[#out + 1] = string.format("  aperture   : f%s -> target f%s",
-			fnum(decision.aperture), fnum(decision.target))
+		out[#out + 1] = string.format("  aperture   : f%s -> target f%s%s",
+			fnum(decision.aperture), fnum(decision.target),
+			decision.autoTarget and "  (the widest this lens opens)" or "")
 		local wide = wideOpenLine(decision)
 		if wide then out[#out + 1] = wide end
 		out[#out + 1] = string.format("  correction : %+.3f stops (gain %.4f)",
@@ -338,8 +360,9 @@ local function signature(decision)
 	if decision.skip then
 		return "skip:" .. decision.skip .. "|" .. zoom
 	end
-	return string.format("%s|%s|%s|%s|%s|%s", decision.lens, tostring(decision.aperture),
-		tostring(decision.reported), tostring(decision.target), tostring(decision.forced), zoom)
+	return string.format("%s|%s|%s|%s|%s|%s|%s", decision.lens, tostring(decision.aperture),
+		tostring(decision.reported), tostring(decision.target), tostring(decision.autoTarget),
+		tostring(decision.forced), zoom)
 end
 
 -- ---------------------------------------------------------------------------
@@ -357,7 +380,7 @@ end
 
 local cached = nil
 
-local function decide(meta, target, force)
+local function decide(meta, target, force, auto)
 	local isTable = type(meta) == "table"
 	local lensRaw = isTable and meta.lens_type or nil
 	local apertureRaw = isTable and meta.aperture or nil
@@ -371,11 +394,11 @@ local function decide(meta, target, force)
 	local c = cached
 	if c and c.isTable == isTable and c.lens == lensRaw and c.aperture == apertureRaw
 		and c.gamma == gammaRaw and c.target == target and c.force == force
-		and c.focal == focalRaw and c.distance == distanceRaw then
+		and c.auto == auto and c.focal == focalRaw and c.distance == distanceRaw then
 		return c.decision
 	end
 
-	local decision = plan(meta, target, force)
+	local decision = plan(meta, target, force, auto)
 	decision.focal = focalRaw
 	decision.focalMm = parseFocal(focalRaw)
 	decision.distance = distanceRaw
@@ -407,6 +430,7 @@ local function decide(meta, target, force)
 		gamma = gammaRaw,
 		target = target,
 		force = force,
+		auto = auto,
 		decision = decision,
 	}
 
@@ -482,7 +506,7 @@ local function timestamp()
 	return "unknown"
 end
 
-local function writeReport(dir, frame, meta, decision, target, force)
+local function writeReport(dir, frame, meta, decision, target, force, auto)
 	local path = string.format("%s/aperture-normalize-%s-%s.txt", dir, clipName(meta), tostring(frame))
 
 	local out = {}
@@ -492,8 +516,10 @@ local function writeReport(dir, frame, meta, decision, target, force)
 	out[#out + 1] = "frame     : " .. tostring(frame)
 	out[#out + 1] = ""
 	out[#out + 1] = "settings"
-	out[#out + 1] = "  target aperture        : f" .. fnum(target)
-	out[#out + 1] = "  force on unknown lenses: " .. (force and "yes" or "no")
+	out[#out + 1] = "  target the lens's widest: " .. (auto and "yes" or "no")
+	out[#out + 1] = "  target aperture         : f" .. fnum(target) ..
+		(decision.autoTarget and "  (unused: the lens's own widest was targeted instead)" or "")
+	out[#out + 1] = "  force on unknown lenses : " .. (force and "yes" or "no")
 	out[#out + 1] = ""
 	out[#out + 1] = "outcome"
 	if decision.skip then
@@ -501,8 +527,9 @@ local function writeReport(dir, frame, meta, decision, target, force)
 	else
 		out[#out + 1] = "  lens       : " .. decision.lens ..
 			(decision.forced and "  (forced, not in the lens database)" or "")
-		out[#out + 1] = string.format("  aperture   : f%s -> target f%s",
-			fnum(decision.aperture), fnum(decision.target))
+		out[#out + 1] = string.format("  aperture   : f%s -> target f%s%s",
+			fnum(decision.aperture), fnum(decision.target),
+			decision.autoTarget and "  (the widest this lens opens)" or "")
 		local wide = wideOpenLine(decision)
 		if wide then out[#out + 1] = wide end
 		out[#out + 1] = string.format("  correction : %+.4f stops (gain %.6f)",
@@ -697,6 +724,17 @@ function Create()
 		LINK_Main = 2,
 	})
 
+	-- On by default, because the widest aperture the lens has is the one
+	-- target that is right for any clip shot with it, and it is what the
+	-- Target Aperture slider would otherwise have to be set to by hand per
+	-- lens. Turn it off to normalise several lenses to a common f-number.
+	InAutoTarget = self:AddInput("Target The Lens's Widest Aperture", "AutoTarget", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "CheckboxControl",
+		INP_Integer = true,
+		INP_Default = 1.0,
+	})
+
 	InTarget = self:AddInput("Target Aperture", "TargetAperture", {
 		LINKID_DataType = "Number",
 		INPID_InputControl = "SliderControl",
@@ -773,8 +811,9 @@ function Process(req)
 
 	local target = InTarget:GetValue(req).Value
 	local force = InForce:GetValue(req).Value > 0.5
+	local auto = InAutoTarget:GetValue(req).Value > 0.5
 
-	local decision = decide(meta, target, force)
+	local decision = decide(meta, target, force, auto)
 
 	-- Tracking the zoom means a ramp reports at every distinct focal length
 	-- rather than only where the aperture steps, which is a lot more lines --
@@ -793,7 +832,7 @@ function Process(req)
 		if dir == "" then
 			print("-- Aperture Normalize: set a Report Folder first")
 		else
-			writeReport(dir, req:GetTime(), meta, decision, target, force)
+			writeReport(dir, req:GetTime(), meta, decision, target, force, auto)
 		end
 	end
 

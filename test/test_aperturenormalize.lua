@@ -14,7 +14,18 @@ local check, contains, near = tap.check, tap.contains, tap.near
 
 local LENS = "Canon EF-S 10-22mm f/3.5-4.5 USM"
 
+-- Most of what follows is about the arithmetic, and reads much better against
+-- a target that stays put, so these pin it to f/4 -- what the slider ships set
+-- to -- rather than letting it follow the lens. The shipped default is that it
+-- does follow the lens; newDefaultTool() is the untouched tool, and the
+-- "normalising to the lens's widest" section below is where that is tested.
 local function newTool()
+	local tool = harness.load(FUSE)
+	tool:set("AutoTarget", 0)
+	return tool
+end
+
+local function newDefaultTool()
 	return harness.load(FUSE)
 end
 
@@ -133,10 +144,22 @@ do
 	check("says why", contains(report, "too large"), report)
 end
 
-tap.section("a correction too small to see is not worth a copy")
+tap.section("a correction of nothing is still a correction")
 do
-	local r = checkPassThrough("already at the target", meta({ aperture = "f4" }))
-	check("says it is already there", contains(r, "already at the target aperture"), r)
+	-- This used to be a pass-through, to save a full-frame copy. It no longer
+	-- is: the Gain output has to publish a number for this frame either way,
+	-- and on a zoom ramp the frame that happens to land on the target sits
+	-- between two that don't, so reporting it as a pass-through made the tool
+	-- look like it had stopped working halfway through the shot.
+	local tool = newTool()
+	local report, out, img = tool:process(meta({ aperture = "f4" }), 1)
+
+	check("a frame already at the target is not passed through", out ~= img)
+	check("its gain is unity", near(appliedGain(out), 1.0), appliedGain(out))
+	check("it is published as unity too", near(tool.out.Gain.Value, 1.0), tool.out.Gain.Value)
+	check("and reported like any other frame", contains(report, "+0.000 stops"), report)
+	check("without claiming to have passed anything through",
+		not contains(report, "passing through"), report)
 end
 
 tap.section("Force On Unknown Lenses")
@@ -531,6 +554,76 @@ do
 		out2.Metadata.aperture_normalize.reported)
 end
 
+tap.section("normalising to the lens's widest aperture")
+do
+	-- The shipped default: aim at the widest aperture the lens has, so the
+	-- clip matches its own wide end and every correction brightens.
+	local tool = newDefaultTool()
+	check("the control is on by default",
+		tool.AutoTarget.Attrs.INP_Default == 1.0, tool.AutoTarget.Attrs.INP_Default)
+
+	local report, out = tool:process(meta({ focal_length = "12mm" }), 1)
+	check("targets f/3.5 rather than the slider's f/4",
+		near(appliedGain(out), (3.7 / 3.5) ^ 2), appliedGain(out))
+	check("says what it targeted", contains(report, "-> target f3.5"), report)
+	check("and where that came from", contains(report, "the widest this lens opens"), report)
+end
+
+do
+	-- At the wide end there is nothing left to undo, since that is where the
+	-- target came from.
+	local tool = newDefaultTool()
+	local _, out = tool:process(meta(), 1)
+	check("the wide end needs no correction", near(appliedGain(out), 1.0), appliedGain(out))
+end
+
+do
+	-- Across the zoom range every correction brightens, which is the point of
+	-- picking the widest: the tool never has to throw light away.
+	local tool = newDefaultTool()
+	for _, focal in ipairs({ "13mm", "17mm", "22mm" }) do
+		local _, out = tool:process(meta({ focal_length = focal }), 1)
+		check("brightens at " .. focal, appliedGain(out) > 1.0, appliedGain(out))
+	end
+
+	local _, out = tool:process(meta({ focal_length = "22mm" }), 2)
+	check("the long end is a full 0.725 stops",
+		near(appliedGain(out), (4.5 / 3.5) ^ 2), appliedGain(out))
+end
+
+do
+	-- Turning it off puts the slider back in charge.
+	local tool = newDefaultTool()
+	tool:set("AutoTarget", 0)
+	local report, out = tool:process(meta({ focal_length = "12mm" }), 1)
+	check("the slider takes over", near(appliedGain(out), (3.7 / 4) ^ 2), appliedGain(out))
+	check("and it stops claiming the lens chose", not contains(report, "widest this lens opens"),
+		report)
+end
+
+do
+	-- An unlisted lens has no widest to aim at, so the slider stands in even
+	-- with the control on. Forcing grants permission, not data.
+	local tool = newDefaultTool()
+	tool:set("Force", 1)
+	local report, out = tool:process(meta({ lens_type = "Sigma 18-35mm f/1.8 DC HSM" }), 1)
+	check("an unlisted lens falls back to the slider",
+		near(appliedGain(out), 0.765625), appliedGain(out))
+	check("and does not pretend otherwise", not contains(report, "widest this lens opens"), report)
+end
+
+do
+	-- The cache has to notice the control, like every other input.
+	local tool = newDefaultTool()
+	local _, out = tool:process(meta({ focal_length = "12mm" }), 1)
+	check("follows the lens first", near(appliedGain(out), (3.7 / 3.5) ^ 2), appliedGain(out))
+
+	tool:set("AutoTarget", 0)
+	local _, out2 = tool:process(meta({ focal_length = "12mm" }), 2)
+	check("and notices when it is switched off", near(appliedGain(out2), (3.7 / 4) ^ 2),
+		appliedGain(out2))
+end
+
 tap.section("Generate Report")
 do
 	local TMP = "test/tmp"
@@ -551,7 +644,9 @@ do
 
 	local written = readFile(TMP .. "/reports/aperture-normalize-A067_08211340_C007-7.txt")
 	check("writes a file named for the clip and frame", written ~= nil)
-	check("records the settings", contains(written, "target aperture        : f4"), written)
+	check("records the settings", contains(written, "target aperture         : f4"), written)
+	check("records which target was chosen",
+		contains(written, "target the lens's widest: no"), written)
 	check("records the outcome", contains(written, "correction : -0.3853 stops"), written)
 	check("dumps the metadata", contains(written, "lens_type = " .. LENS), written)
 	check("shows the zoom in the outcome", contains(written, "zoom       : 10mm"), written)
@@ -570,6 +665,17 @@ do
 	tool2:process(meta({ lens_type = "Sigma 18-35mm f/1.8 DC HSM" }), 9)
 	local skipped = readFile(TMP .. "/reports/aperture-normalize-A067_08211340_C007-9.txt")
 	check("reports a pass-through and why", contains(skipped, "passed through, because"), skipped)
+
+	-- With the target following the lens, the slider is still recorded, but
+	-- saying so without saying it went unused would be misleading.
+	local tool4 = newDefaultTool()
+	tool4:set("ReportDir", TMP .. "/reports")
+	tool4:press("GenerateReport")
+	tool4:process(meta({ focal_length = "12mm" }), 11)
+	local auto = readFile(TMP .. "/reports/aperture-normalize-A067_08211340_C007-11.txt")
+	check("records that the lens chose the target",
+		contains(auto, "target the lens's widest: yes"), auto)
+	check("and that the slider went unused", contains(auto, "unused"), auto)
 
 	-- No folder set is a mistake worth naming.
 	local tool3 = newTool()
