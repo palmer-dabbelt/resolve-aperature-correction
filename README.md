@@ -36,6 +36,8 @@ real clip.
 | Report | *When It Changes* (default), *Every Frame*, or *Never*. |
 | List Every Field | Include metadata that isn't lens-related in the dump. On by default. |
 | Report Again | Forces a fresh report, ignoring what was reported before. |
+| Log Directory | Empty by default. Set it to also dump to disk. |
+| Start Log Over | Truncates the dumps and starts the capture again. |
 
 *When It Changes* exists so the tool can sit in a comp while you scrub without
 burying the Console. It re-reports when the set of metadata keys changes, or
@@ -74,6 +76,34 @@ The three outcomes that matter:
 Key matching is spelling-insensitive: keys are folded to lowercase alphanumerics
 before comparison, so `F-Number`, `f_stop` and `FNumber` all register. Nested
 metadata is flattened to dotted paths (`Lens.FocalLength`).
+
+**Logging to disk.** Reading the Console gets old once you want the whole clip
+at once. Set **Log Directory** and the tool also writes, per clip:
+
+```
+<dir>/<clip>.csv    one row per field per frame: frame,field,value
+<dir>/<clip>.log    the same text that goes to the Console
+```
+
+Logging is off until you set that path — a fuse that silently started writing
+files would be rude. The dumps are named after the clip, so probing a second
+one doesn't append to the first one's files.
+
+The Console report and the dumps are gated differently on purpose. The Console
+is a live diagnostic, so it obeys the Report control. The files are a data
+capture, so they record every frame that renders, exactly once each, whatever
+Report is set to — scrub or render the clip and the CSV fills in behind you.
+Re-rendering a frame doesn't duplicate its rows; **Start Log Over** truncates
+and begins again.
+
+The CSV is long-format (`frame,field,value`) rather than one column per field.
+That keeps every row self-contained, which matters because Fusion renders
+frames on several threads and out of order. Rows may therefore not be in frame
+order — sort them if you care.
+
+A sandboxed Resolve may refuse to write outside its container. If that happens
+the tool says so in the Console once, with the path and the underlying error,
+rather than failing silently.
 
 **Worth trying more than one setup.** Metadata availability varies by source, so
 if the first answer is "nothing", it's worth probing a `MediaIn` on the Fusion

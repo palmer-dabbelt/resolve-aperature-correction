@@ -44,7 +44,7 @@ function harness.load(path)
 			ID = id,
 			Attrs = attrs,
 			isImage = (attrs.LINKID_DataType == "Image"),
-			value = attrs.INP_Default or 0,
+			value = attrs.INPS_DefaultText or attrs.INP_Default or 0,
 			image = nil,
 		}
 
@@ -122,9 +122,14 @@ function harness.load(path)
 		return report, self.outputs[#self.outputs], img
 	end
 
-	-- Clicks the "Report Again" button.
+	-- Clicks a ButtonControl, by the input ID given to AddInput.
+	function fuse:press(id)
+		assert(self[id], "no such input: " .. tostring(id))
+		self.env.NotifyChanged(self[id], { Value = 1 }, 0)
+	end
+
 	function fuse:reportAgain()
-		self.env.NotifyChanged(self.env.InAgain, { Value = 1 }, 0)
+		self:press("ReportAgain")
 	end
 
 	return fuse

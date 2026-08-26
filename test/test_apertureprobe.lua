@@ -169,6 +169,137 @@ do
 	check("count still reported", contains(report, "2 field(s) total"), report)
 end
 
+--
+-- Logging to disk. Off unless a Log Directory is set.
+--
+
+local TMP = "test/tmp"
+local LOGDIR = TMP .. "/logs"
+
+local function readFile(path)
+	local f = io.open(path, "r")
+	if not f then return nil end
+	local s = f:read("*a")
+	f:close()
+	return s
+end
+
+local function occurrences(hay, needle)
+	local n, pos = 0, 1
+	while true do
+		local s, e = hay:find(needle, pos, true)
+		if not s then break end
+		n, pos = n + 1, e + 1
+	end
+	return n
+end
+
+local function freshLogDir()
+	os.execute("rm -rf " .. TMP)
+	return LOGDIR
+end
+
+local BRAW = {
+	Filename = "/clips/A067_08211340_C007.braw",
+	aperture = "f3.5",
+	focal_length = "10mm",
+	iso = "400",
+}
+
+print("logging is opt-in")
+do
+	freshLogDir()
+	local probe = newProbe()
+	check("defaults to no log directory", probe.LogDir.value == "", probe.LogDir.value)
+	probe:process(BRAW, 1)
+	check("writes nothing by default", readFile(LOGDIR .. "/A067_08211340_C007.csv") == nil)
+end
+
+print("logging writes csv and log")
+do
+	freshLogDir()
+	local probe = newProbe()
+	probe:set("LogDir", LOGDIR)
+	probe:process(BRAW, 1)
+
+	local csv = readFile(LOGDIR .. "/A067_08211340_C007.csv")
+	local log = readFile(LOGDIR .. "/A067_08211340_C007.log")
+
+	check("creates the directory and the csv", csv ~= nil)
+	check("csv has a header", csv and csv:find("frame,field,value", 1, true) == 1, csv)
+	check("csv has the aperture row", csv and occurrences(csv, "1,aperture,f3.5") == 1, csv)
+	check("csv has the focal length row", csv and occurrences(csv, "1,focal_length,10mm") == 1, csv)
+	check("csv names the clip, not the path", csv and occurrences(csv, "1,Filename,") == 1, csv)
+	check("writes the log too", log ~= nil and log:find("APERTURE:", 1, true) ~= nil, log)
+end
+
+print("log records every frame exactly once")
+do
+	freshLogDir()
+	local probe = newProbe()
+	probe:set("LogDir", LOGDIR)
+	probe:process(BRAW, 1)
+	probe:process(BRAW, 1)          -- a re-render of the same frame
+	probe:process(BRAW, 2)
+
+	local csv = readFile(LOGDIR .. "/A067_08211340_C007.csv")
+	check("re-rendering a frame does not duplicate it", occurrences(csv, "1,aperture,f3.5") == 1, csv)
+	check("a second frame is recorded", occurrences(csv, "2,aperture,f3.5") == 1, csv)
+	check("only one header", occurrences(csv, "frame,field,value") == 1, csv)
+end
+
+print("log ignores the Report setting")
+do
+	freshLogDir()
+	local probe = newProbe()
+	probe:set("LogDir", LOGDIR)
+	probe:set("Report", 2)          -- Never: nothing to the Console
+	local report = probe:process(BRAW, 1)
+	check("Console stays silent", report == nil, report)
+	check("but the capture still happens",
+		readFile(LOGDIR .. "/A067_08211340_C007.csv") ~= nil)
+end
+
+print("csv escaping")
+do
+	freshLogDir()
+	local probe = newProbe()
+	probe:set("LogDir", LOGDIR)
+	probe:process({ Filename = "/clips/x.braw", notes = 'has, a comma and "quotes"' }, 1)
+
+	local csv = readFile(LOGDIR .. "/x.csv")
+	check("quotes fields containing commas",
+		csv and csv:find('"has, a comma and ""quotes"""', 1, true) ~= nil, csv)
+end
+
+print("clip naming")
+do
+	freshLogDir()
+	local probe = newProbe()
+	probe:set("LogDir", LOGDIR)
+	probe:process({ aperture = "f3.5" }, 1)   -- no Filename at all
+	check("falls back when there is no Filename",
+		readFile(LOGDIR .. "/aperture-probe.csv") ~= nil)
+end
+
+print("Start Log Over")
+do
+	freshLogDir()
+	local probe = newProbe()
+	probe:set("LogDir", LOGDIR)
+	probe:process(BRAW, 1)
+	probe:process(BRAW, 2)
+	probe:press("ResetLog")
+	probe:process(BRAW, 1)
+
+	local csv = readFile(LOGDIR .. "/A067_08211340_C007.csv")
+	check("truncates rather than appending", occurrences(csv, "2,aperture,f3.5") == 0, csv)
+	check("starts again from the header", occurrences(csv, "frame,field,value") == 1, csv)
+	check("and records the frame again", occurrences(csv, "1,aperture,f3.5") == 1, csv)
+end
+
+os.execute("rm -rf " .. TMP)
+
 print("")
 print(string.format("%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)
