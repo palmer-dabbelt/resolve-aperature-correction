@@ -53,15 +53,18 @@ reports. It deliberately does *not* override the rest. Those are cases where
 the maths would be wrong rather than merely unvouched-for, and forcing is about
 lenses you know are fine, not about overriding arithmetic.
 
-When it *does* correct, it stamps `aperture_normalize.{gain,stops,from,target,lens}`
-into the output metadata, so an Aperture Probe placed downstream — or its CSV
-dump — shows the correction next to the values it came from.
+When it *does* correct, it stamps
+`aperture_normalize.{gain,stops,from,target,lens,forced,focal,distance}` into
+the output metadata, so a tool placed downstream shows the correction next to
+the values it came from.
 
 | Control | What it does |
 | --- | --- |
 | Target Aperture | The f-number to normalise to. Default 4. |
 | Force On Unknown Lenses | Correct lenses that aren't in the database. Off by default. |
-| Report | *When It Changes* (default), *Every Frame*, or *Never*. |
+| Processing | *GPU (falls back to CPU)* by default, or *CPU* to compare the two. |
+| Console Logging | Master switch for Console output. On by default. |
+| Report | *When It Changes* (default) or *Every Frame*. |
 | Report Folder | Where **Generate Report** writes. |
 | Generate Report | Dumps the current frame's full state to a file. |
 
@@ -76,20 +79,55 @@ It fires once per press rather than continuously, and it's most useful on a
 frame that *isn't* being corrected — the report says exactly which check
 rejected it. This is what replaced needing Aperture Probe in the comp.
 
+#### Zoom position
+
+The camera reports the aperture quantised to marked stops — it jumps f/3.5,
+f/3.6, f/4 — but the light a variable-aperture zoom actually passes ramps
+smoothly with zoom position. So the focal length is the finer-grained signal,
+and the report carries it, along with the focus distance, which also bears on
+how much light reaches the sensor:
+
+```
+-- Aperture Normalize [ApertureNormalize1] frame 5886 --
+  lens       : Canon EF-S 10-22mm f/3.5-4.5 USM
+  aperture   : f3.5 -> target f4
+  correction : -0.385 stops (gain 0.7656)
+  zoom       : 10mm  (focus 2240mm to 6480mm)
+```
+
+The zoom counts as a change, so a ramp reports at every distinct focal length
+rather than only where the reported f-number steps — which is what makes the
+output usable for deriving a correction curve. It is reported on frames that
+are *passed through* too, since those are part of the same curve. That is a lot
+more lines than before, hence **Console Logging** as a master switch.
+
+The lens database's `stops` table is still keyed by f-number. Keying a
+correction on focal length instead is the obvious next step, once there is
+measured data to key it on.
+
 #### Performance
 
 The tool runs on every frame of playback, and a 6K frame is a few hundred
-megabytes, so the per-frame cost is mostly memory traffic:
+megabytes.
 
-- The correction is a single `ChannelOpOf("Multiply", ...)`, which reads the
-  frame and writes the result once. `CopyOf` followed by `Gain` — the pattern
-  the SDK example uses — walks the whole image twice.
-- Alpha is left out of the operation entirely rather than multiplied by 1.
+Resolve composites on the GPU, so a fuse that touches pixels from Lua drags the
+whole frame down to host memory and back — which costs far more than the
+multiply itself. The correction is therefore a DCTL compute kernel, running
+where the image already is. If no GPU path is available the tool falls back to
+`CopyOf` + `Gain` on the CPU, says so in the Console once, and does not retry:
+the kernel either compiles on a given machine or it does not, and retrying per
+frame would cost a failed compile on top of the CPU work.
+
+**Processing** forces the CPU path, which is there to compare the two.
+
+Beyond that:
+
+- Alpha is never touched. It is coverage, not light.
 - A frame needing no correction is passed through by reference, so a clip shot
   at the target aperture costs nothing at all.
 - The decision is recomputed only when something it depends on changes: the
-  lens, the aperture, the encoding, or a control. On a static shot that is once
-  per clip rather than once per frame.
+  lens, the aperture, the zoom, the encoding, or a control. On a static shot
+  that is once per clip rather than once per frame.
 
 #### The lens database
 

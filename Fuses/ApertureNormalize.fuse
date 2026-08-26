@@ -103,6 +103,14 @@ local function parseAperture(s)
 	return tonumber(n)
 end
 
+-- "10mm" -> 10. The camera reports apertures quantised to marked stops, but
+-- the light a variable-aperture zoom actually passes ramps smoothly with zoom
+-- position, so focal length is the finer-grained signal of the two.
+local function parseFocal(s)
+	if type(s) ~= "string" and type(s) ~= "number" then return nil end
+	return tonumber(tostring(s):match("(%d+%.?%d*)"))
+end
+
 local function interpolateStops(tbl, n)
 	if type(tbl) ~= "table" then return 0 end
 
@@ -206,6 +214,18 @@ local function toolName()
 	return "ApertureNormalize"
 end
 
+-- The zoom position, and the focus distance alongside it: both bear on how
+-- much light actually reaches the sensor, and neither is quantised the way the
+-- reported aperture is.
+local function zoomLine(decision)
+	if not decision.focal then return nil end
+	local line = "  zoom       : " .. tostring(decision.focal)
+	if decision.distance then
+		line = line .. "  (focus " .. tostring(decision.distance) .. ")"
+	end
+	return line
+end
+
 local function buildReport(frame, decision)
 	local out = {}
 	out[#out + 1] = "-- Aperture Normalize [" .. toolName() .. "] frame " .. tostring(frame) .. " --"
@@ -221,6 +241,9 @@ local function buildReport(frame, decision)
 			decision.stops, decision.gain)
 	end
 
+	local zoom = zoomLine(decision)
+	if zoom then out[#out + 1] = zoom end
+
 	return table.concat(out, "\n")
 end
 
@@ -228,11 +251,12 @@ end
 -- part of it: on a zoom the aperture changes every few frames and that is
 -- exactly what we want to see, but a static shot should report once.
 local function signature(decision)
+	local zoom = tostring(decision.focal) .. "|" .. tostring(decision.distance)
 	if decision.skip then
-		return "skip:" .. decision.skip
+		return "skip:" .. decision.skip .. "|" .. zoom
 	end
-	return string.format("%s|%s|%s|%s", decision.lens, tostring(decision.aperture),
-		tostring(decision.target), tostring(decision.forced))
+	return string.format("%s|%s|%s|%s|%s", decision.lens, tostring(decision.aperture),
+		tostring(decision.target), tostring(decision.forced), zoom)
 end
 
 -- ---------------------------------------------------------------------------
@@ -254,6 +278,8 @@ local function decide(meta, target, force)
 	local isTable = type(meta) == "table"
 	local lensRaw = isTable and meta.lens_type or nil
 	local apertureRaw = isTable and meta.aperture or nil
+	local focalRaw = isTable and meta.focal_length or nil
+	local distanceRaw = isTable and meta.distance or nil
 	local gammaRaw = nil
 	if isTable and type(meta.GammaSpace) == "table" then
 		gammaRaw = meta.GammaSpace.Gamma
@@ -261,11 +287,15 @@ local function decide(meta, target, force)
 
 	local c = cached
 	if c and c.isTable == isTable and c.lens == lensRaw and c.aperture == apertureRaw
-		and c.gamma == gammaRaw and c.target == target and c.force == force then
+		and c.gamma == gammaRaw and c.target == target and c.force == force
+		and c.focal == focalRaw and c.distance == distanceRaw then
 		return c.decision
 	end
 
 	local decision = plan(meta, target, force)
+	decision.focal = focalRaw
+	decision.focalMm = parseFocal(focalRaw)
+	decision.distance = distanceRaw
 	decision.sig = signature(decision)
 
 	-- Precomputed here rather than per frame: it depends only on the decision.
@@ -277,6 +307,8 @@ local function decide(meta, target, force)
 			target = string.format("f%s", tostring(decision.target)),
 			lens = decision.lens,
 			forced = decision.forced and "1" or "0",
+			focal = focalRaw and tostring(focalRaw) or nil,
+			distance = distanceRaw and tostring(distanceRaw) or nil,
 		}
 	end
 
@@ -284,6 +316,8 @@ local function decide(meta, target, force)
 		isTable = isTable,
 		lens = lensRaw,
 		aperture = apertureRaw,
+		focal = focalRaw,
+		distance = distanceRaw,
 		gamma = gammaRaw,
 		target = target,
 		force = force,
@@ -386,6 +420,10 @@ local function writeReport(dir, frame, meta, decision, target, force)
 		out[#out + 1] = string.format("  correction : %+.4f stops (gain %.6f)",
 			decision.stops, decision.gain)
 	end
+	if decision.focal then
+		out[#out + 1] = "  zoom       : " .. tostring(decision.focal) ..
+			(decision.distance and ("  (focus " .. tostring(decision.distance) .. ")") or "")
+	end
 	out[#out + 1] = ""
 	out[#out + 1] = "metadata"
 
@@ -416,6 +454,98 @@ local function writeReport(dir, frame, meta, decision, target, force)
 	f:close()
 
 	print("-- Aperture Normalize: wrote " .. path)
+end
+
+-- ---------------------------------------------------------------------------
+-- Applying the gain
+-- ---------------------------------------------------------------------------
+--
+-- Resolve composites on the GPU, so a fuse that touches pixels from Lua drags
+-- the whole frame down to host memory and back. At 6K that is a few hundred
+-- megabytes each way, every frame, which costs far more than the multiply. A
+-- DCTL kernel keeps the work where the image already is.
+--
+-- The CPU path is kept as a fallback for hosts without a usable GPU, and can
+-- be selected deliberately from the Processing control to compare the two.
+
+ApertureGainParams = [==[
+	float gain;
+	int srcsize[2];
+]==]
+
+ApertureGainSource = [==[
+__KERNEL__ void ApertureGainKernel(__CONSTANTREF__ ApertureGainParams *params,
+                                   __TEXTURE2D__ src, __TEXTURE2D_WRITE__ dst)
+{
+	DEFINE_KERNEL_ITERATORS_XY(x, y)
+
+	if (x < params->srcsize[0] && y < params->srcsize[1])
+	{
+		float4 col = _tex2DVecN(src, x, y, 15);
+
+		// Alpha is coverage, not light, so it is deliberately left alone.
+		col.x *= params->gain;
+		col.y *= params->gain;
+		col.z *= params->gain;
+
+		_tex2DVec4Write(dst, x, y, col);
+	}
+}
+]==]
+
+-- Returns the corrected image, or nil if the GPU path is unavailable for any
+-- reason -- no compute node, a kernel that will not compile, a host with no
+-- GPU at all. Every failure is a fallback, never an error.
+local function applyGainGPU(req, img, gain)
+	local out = Image({ IMG_Like = img })
+	if not out then return nil end
+
+	local node = DVIPComputeNode(req, "ApertureGainKernel", ApertureGainSource,
+		"ApertureGainParams", ApertureGainParams)
+	if not node then return nil end
+
+	local params = node:GetParamBlock(ApertureGainParams)
+	params.gain = gain
+	params.srcsize[0] = img.DataWindow:Width()
+	params.srcsize[1] = img.DataWindow:Height()
+	node:SetParamBlock(params)
+
+	-- Point sampling in pixel coordinates: this reads each pixel exactly once
+	-- at its own position, so there is nothing to interpolate.
+	node:AddSampler("RowSampler", TEX_FILTER_MODE_POINT, TEX_ADDRESS_MODE_CLAMP,
+		TEX_NORMALIZED_COORDS_FALSE)
+	node:AddInput("src", img)
+	node:AddOutput("dst", out)
+
+	if not node:RunSession(req) then return nil end
+	return out
+end
+
+local function applyGainCPU(img, gain)
+	local out = img:CopyOf()
+	out:Gain(gain, gain, gain, 1.0)
+	return out
+end
+
+-- Once the GPU path has failed there is no reason to expect it to work on the
+-- next frame: the kernel either compiles on this machine or it does not.
+-- Retrying per frame would cost a failed compile on top of the CPU work, which
+-- is worse than never having tried.
+local gpuUnavailable = false
+
+local function applyGain(req, img, gain, wantGPU)
+	if wantGPU and not gpuUnavailable then
+		-- pcall because a host without the DCTL entry points would otherwise
+		-- raise rather than simply not have a GPU path.
+		local ok, out = pcall(applyGainGPU, req, img, gain)
+		if ok and out then return out end
+
+		gpuUnavailable = true
+		print("-- Aperture Normalize: no GPU path available, using the CPU from here on" ..
+			((not ok) and ("\n   " .. tostring(out)) or ""))
+	end
+
+	return applyGainCPU(img, gain)
 end
 
 local lastSignature = nil
@@ -449,6 +579,23 @@ function Create()
 		INP_Default = 0.0,
 	})
 
+	InProcessing = self:AddInput("Processing", "Processing", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "ComboControl",
+		INP_Default = 0.0,
+		INP_Integer = true,
+		{ CCS_AddString = "GPU (falls back to CPU)", },
+		{ CCS_AddString = "CPU", },
+		CC_LabelPosition = "Vertical",
+	})
+
+	InConsole = self:AddInput("Console Logging", "ConsoleLogging", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "CheckboxControl",
+		INP_Integer = true,
+		INP_Default = 1.0,
+	})
+
 	InWhen = self:AddInput("Report", "Report", {
 		LINKID_DataType = "Number",
 		INPID_InputControl = "ComboControl",
@@ -456,7 +603,6 @@ function Create()
 		INP_Integer = true,
 		{ CCS_AddString = "When It Changes", },
 		{ CCS_AddString = "Every Frame", },
-		{ CCS_AddString = "Never", },
 		CC_LabelPosition = "Vertical",
 	})
 
@@ -493,9 +639,12 @@ function Process(req)
 
 	local decision = decide(meta, target, force)
 
-	local when = InWhen:GetValue(req).Value
-	if when ~= 2 then
-		if when == 1 or decision.sig ~= lastSignature then
+	-- Tracking the zoom means a ramp reports at every distinct focal length
+	-- rather than only where the aperture steps, which is a lot more lines --
+	-- hence the master switch.
+	if InConsole:GetValue(req).Value > 0.5 then
+		local everyFrame = InWhen:GetValue(req).Value > 0.5
+		if everyFrame or decision.sig ~= lastSignature then
 			lastSignature = decision.sig
 			print(buildReport(req:GetTime(), decision))
 		end
@@ -518,13 +667,7 @@ function Process(req)
 		return
 	end
 
-	-- One pass over the frame. CopyOf followed by Gain would read and write
-	-- the whole image twice, and a 6K frame is a few hundred megabytes; a
-	-- multiplying ChannelOpOf returns the new image directly. Alpha is left
-	-- out of the options table, which leaves that plane untouched -- it is
-	-- coverage, not light.
-	local gain = decision.gain
-	local out = img:ChannelOpOf("Multiply", nil, { R = gain, G = gain, B = gain })
+	local out = applyGain(req, img, decision.gain, InProcessing:GetValue(req).Value < 0.5)
 	stamp(out, decision)
 
 	OutImage:Set(req, out)

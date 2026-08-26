@@ -26,6 +26,7 @@ local function meta(over)
 		lens_type = LENS,
 		aperture = "f3.5",
 		focal_length = "10mm",
+		distance = "2240mm to 6480mm",
 		GammaSpace = { Gamma = 1 },
 	}
 	for k, v in pairs(over or {}) do
@@ -35,16 +36,19 @@ local function meta(over)
 	return m
 end
 
--- The gain a correcting frame applied, or nil if it passed through.
+-- The gain a correcting frame applied, whichever path applied it, or nil if
+-- the frame passed through.
 local function appliedGain(out)
-	return out.channelOp and out.channelOp.options and out.channelOp.options.R
+	if out.gpu then return out.gpu.gain end
+	if out.gains[1] then return out.gains[1].r end
+	return nil
 end
 
 local function checkPassThrough(label, metadata, tool)
 	tool = tool or newTool()
 	local report, out, img = tool:process(metadata, 1)
 	check(label .. ": output is the input", out == img, report)
-	check(label .. ": nothing was applied", out.channelOp == nil)
+	check(label .. ": nothing was applied", appliedGain(out) == nil)
 	check(label .. ": says so in the Console", contains(report, "passing through"), report)
 	return report
 end
@@ -64,14 +68,8 @@ do
 	local tool = newTool()
 	local report, out, img = tool:process(meta(), 1)
 
-	check("output is a new image", out ~= img and out.copiedFrom == img)
-	check("multiplies in a single pass", out.channelOp and out.channelOp.operation == "Multiply",
-		out.channelOp and out.channelOp.operation)
+	check("output is a new image", out ~= img)
 	check("gain is (3.5/4)^2", near(appliedGain(out), 0.765625), appliedGain(out))
-	check("applied equally to R, G and B",
-		out.channelOp.options.R == out.channelOp.options.G and
-		out.channelOp.options.G == out.channelOp.options.B)
-	check("alpha is left out entirely", out.channelOp.options.A == nil)
 	check("reports the stops", contains(report, "-0.385 stops"), report)
 	check("names the lens", contains(report, LENS), report)
 end
@@ -130,7 +128,7 @@ do
 	local tool = newTool()
 	tool:set("TargetAperture", 0.5)
 	local report, out, img = tool:process(meta({ aperture = "f29" }), 1)
-	check("absurd correction is refused", out == img and out.channelOp == nil, report)
+	check("absurd correction is refused", out == img and appliedGain(out) == nil, report)
 	check("says why", contains(report, "too large"), report)
 end
 
@@ -193,6 +191,65 @@ do
 	end
 end
 
+tap.section("the correction runs on the GPU")
+do
+	local tool = newTool()
+	local _, out, img = tool:process(meta(), 1)
+
+	check("used the GPU", out.gpu ~= nil)
+	check("ran the aperture kernel", out.gpu and out.gpu.kernel == "ApertureGainKernel",
+		out.gpu and out.gpu.kernel)
+	check("handed the kernel the gain", near(out.gpu.gain, 0.765625), out.gpu.gain)
+	check("read the source image", out.gpu.inputs.src == img)
+	check("sampled point-wise in pixel coordinates",
+		out.gpu.sampler.filter == "point" and out.gpu.sampler.norm == false,
+		out.gpu.sampler and out.gpu.sampler.filter)
+	check("did not also do it on the CPU", #out.gains == 0)
+end
+
+do
+	-- Processing = CPU, for comparing the two paths.
+	local tool = newTool()
+	tool:set("Processing", 1)
+	local _, out = tool:process(meta(), 1)
+
+	check("CPU path leaves the GPU alone", out.gpu == nil)
+	check("CPU path applies the same gain", near(appliedGain(out), 0.765625), appliedGain(out))
+	check("CPU path leaves alpha at unity", out.gains[1].a == 1.0, out.gains[1].a)
+end
+
+do
+	-- A host with no GPU falls back rather than failing.
+	local tool = newTool()
+	tool.gpuAvailable = false
+	local report, out = tool:process(meta(), 1)
+
+	check("falls back to the CPU", out.gpu == nil and near(appliedGain(out), 0.765625), appliedGain(out))
+	check("says so once", contains(tool.printed[#tool.printed], "no GPU path available"),
+		tool.printed[#tool.printed])
+
+	local before = #tool.printed
+	tool.lastNode = nil
+	tool.gpuAvailable = true          -- even if a GPU turns up, don't go back
+	tool:process(meta({ aperture = "f4.5" }), 2)
+
+	local complaints = 0
+	for i = before + 1, #tool.printed do
+		if contains(tool.printed[i], "no GPU path available") then complaints = complaints + 1 end
+	end
+	check("and does not keep saying it", complaints == 0)
+	check("and does not keep retrying it", tool.lastNode == nil)
+end
+
+do
+	-- A kernel that will not run is also just a fallback.
+	local tool = newTool()
+	tool.gpuRuns = false
+	local _, out = tool:process(meta(), 1)
+	check("a failed kernel falls back too",
+		out.gpu == nil and near(appliedGain(out), 0.765625), appliedGain(out))
+end
+
 tap.section("metadata stamping")
 do
 	local tool = newTool()
@@ -206,6 +263,9 @@ do
 	check("records the target", stamped and stamped.target == "f4", stamped and stamped.target)
 	check("records the lens", stamped and stamped.lens == LENS)
 	check("records that it was not forced", stamped and stamped.forced == "0", stamped and stamped.forced)
+	check("records the zoom position", stamped and stamped.focal == "10mm", stamped and stamped.focal)
+	check("records the focus distance",
+		stamped and stamped.distance == "2240mm to 6480mm", stamped and stamped.distance)
 	check("keeps the original fields", out.Metadata.focal_length == "10mm")
 
 	check("does not mutate the input's metadata", input.aperture_normalize == nil)
@@ -232,7 +292,7 @@ do
 	check("a new force setting is noticed", appliedGain(out4) ~= nil)
 
 	local _, out5 = tool:process(meta({ GammaSpace = { Gamma = 2.2 } }), 6)
-	check("a new gamma is noticed", out5.channelOp == nil)
+	check("a new gamma is noticed", appliedGain(out5) == nil)
 end
 
 tap.section("reporting")
@@ -259,10 +319,40 @@ end
 
 do
 	local tool = newTool()
-	tool:set("Report", 2)                 -- Never
+	tool:set("ConsoleLogging", 0)
 	local report, out = tool:process(meta(), 1)
-	check("Never stays silent", report == nil, report)
+	check("Console Logging off stays silent", report == nil, report)
 	check("but still corrects", appliedGain(out) ~= nil)
+end
+
+tap.section("zoom position")
+do
+	local tool = newTool()
+	local report = tool:process(meta(), 1)
+	check("reports the focal length", contains(report, "zoom       : 10mm"), report)
+	check("and the focus distance", contains(report, "focus 2240mm to 6480mm"), report)
+
+	-- The whole point: the aperture is quantised but the zoom is not, so a
+	-- ramp must report at every distinct focal length, not only where the
+	-- reported f-number happens to step.
+	local same = tool:process(meta(), 2)
+	check("silent while the zoom holds", same == nil, same)
+
+	local moved = tool:process(meta({ focal_length = "12mm" }), 3)
+	check("reports when the zoom moves at a constant aperture",
+		contains(moved, "zoom       : 12mm"), moved)
+
+	local focused = tool:process(meta({ focal_length = "12mm", distance = "1000mm to 2000mm" }), 4)
+	check("reports when the focus distance moves", focused ~= nil, focused)
+end
+
+do
+	-- A pass-through still says where the lens was, which is what makes the
+	-- skipped frames useful when working out a correction curve.
+	local tool = newTool()
+	local report = tool:process(meta({ aperture = "f4" }), 1)
+	check("zoom is reported on a pass-through too",
+		contains(report, "zoom       : 10mm"), report)
 end
 
 tap.section("Generate Report")
@@ -288,6 +378,7 @@ do
 	check("records the settings", contains(written, "target aperture        : f4"), written)
 	check("records the outcome", contains(written, "correction : -0.3853 stops"), written)
 	check("dumps the metadata", contains(written, "lens_type = " .. LENS), written)
+	check("shows the zoom in the outcome", contains(written, "zoom       : 10mm"), written)
 	check("flattens nested metadata", contains(written, "GammaSpace.Gamma = 1"), written)
 
 	-- One press, one report.

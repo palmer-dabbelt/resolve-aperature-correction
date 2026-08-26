@@ -18,6 +18,12 @@ function harness.image(metadata)
 		gains = {},
 	}
 
+	-- Fuses ask the image for its region rather than its nominal size.
+	img.DataWindow = {
+		Width = function() return 1920 end,
+		Height = function() return 1080 end,
+	}
+
 	function img:CopyOf()
 		local copy = harness.image(self.Metadata)
 		copy.copiedFrom = self
@@ -50,9 +56,80 @@ function harness.load(path)
 		registration = nil,
 		printed = {},
 		outputs = {},
+
+		-- Whether the stubbed GPU is present, and whether its kernels run.
+		-- Both default on; a test flips them to exercise the fallbacks.
+		gpuAvailable = true,
+		gpuRuns = true,
 	}
 
 	env.CT_Tool = "CT_Tool"
+
+	-- DCTL sampler modes. The fuse only passes these straight through, so
+	-- their values matter no more than that they are distinguishable.
+	env.TEX_FILTER_MODE_POINT = "point"
+	env.TEX_FILTER_MODE_LINEAR = "linear"
+	env.TEX_ADDRESS_MODE_CLAMP = "clamp"
+	env.TEX_ADDRESS_MODE_BORDER = "border"
+	env.TEX_NORMALIZED_COORDS_FALSE = false
+	env.TEX_NORMALIZED_COORDS_TRUE = true
+
+	function env.Image(attrs)
+		local like = attrs and attrs.IMG_Like
+		local img = harness.image(like and like.Metadata or nil)
+		img.createdFrom = like
+		return img
+	end
+
+	-- A stand-in GPU compute node. It doesn't run a kernel, it records what it
+	-- was asked to run so a test can check the parameters that reached it.
+	function env.DVIPComputeNode(req, kernelName, kernelSource, paramsName, paramsBlock)
+		if not fuse.gpuAvailable then return nil end
+
+		local node = {
+			kernel = kernelName,
+			source = kernelSource,
+			inputs = {},
+			outputs = {},
+			params = {},
+		}
+
+		function node:GetParamBlock()
+			return { srcsize = {} }
+		end
+
+		function node:SetParamBlock(params)
+			self.params = params
+		end
+
+		function node:AddSampler(name, filterMode, addressMode, normCoords)
+			self.sampler = { name = name, filter = filterMode, address = addressMode, norm = normCoords }
+		end
+
+		function node:AddInput(name, image)
+			self.inputs[name] = image
+		end
+
+		function node:AddOutput(name, image)
+			self.outputs[name] = image
+		end
+
+		function node:RunSession(request)
+			if not fuse.gpuRuns then return false end
+			for _, image in pairs(self.outputs) do
+				image.gpu = {
+					kernel = self.kernel,
+					gain = self.params.gain,
+					sampler = self.sampler,
+					inputs = self.inputs,
+				}
+			end
+			return true
+		end
+
+		fuse.lastNode = node
+		return node
+	end
 
 	function env.FuRegisterClass(name, classtype, attrs)
 		fuse.registration = { name = name, classtype = classtype, attrs = attrs }
