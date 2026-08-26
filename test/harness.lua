@@ -10,6 +10,27 @@ that is out of scope here.
 
 local harness = {}
 
+-- A stand-in Image. Records the Gain() calls made against it so a test can
+-- assert on the correction that was applied, and copies like the real thing.
+function harness.image(metadata)
+	local img = {
+		Metadata = metadata,
+		gains = {},
+	}
+
+	function img:CopyOf()
+		local copy = harness.image(self.Metadata)
+		copy.copiedFrom = self
+		return copy
+	end
+
+	function img:Gain(r, g, b, a)
+		self.gains[#self.gains + 1] = { r = r, g = g, b = b, a = a }
+	end
+
+	return img
+end
+
 -- Loads a .fuse into its own sandboxed global table and runs Create().
 -- Returns a handle for driving Process() and inspecting what came out.
 function harness.load(path)
@@ -79,7 +100,10 @@ function harness.load(path)
 		end,
 
 		GetAttrs = function(_)
-			return { TOOLS_Name = "ApertureProbe1" }
+			-- Named after whichever class registered itself, so reports in
+			-- the test output say what they are.
+			local name = fuse.registration and fuse.registration.name or "Tool"
+			return { TOOLS_Name = name .. "1" }
 		end,
 
 		AddControlPage = function() end,
@@ -105,7 +129,7 @@ function harness.load(path)
 	-- Runs Process() against an image carrying the supplied metadata table,
 	-- and returns the report text (or nil when nothing was reported).
 	function fuse:process(metadata, frame)
-		local img = { Metadata = metadata }
+		local img = harness.image(metadata)
 		self.env.InImage.image = img
 
 		local before = #self.printed

@@ -1,0 +1,297 @@
+--[[--
+ApertureNormalize
+=================
+
+Undoes the exposure ramp of a variable-aperture zoom.
+
+A lens sold as 10-22mm f/3.5-4.5 loses light as you zoom in: the maximum
+aperture narrows from f/3.5 to f/4.5 across the zoom range, so a shot that
+zooms also brightens or darkens, for reasons that have nothing to do with the
+scene. Blackmagic cameras record the aperture per frame in BRAW metadata, so
+the ramp can be measured rather than guessed at.
+
+Illuminance at the sensor goes as 1/N^2 for an f-number N, so matching a frame
+shot at N to what it would have been at the target aperture is a gain of
+(N / target)^2 -- a pure multiply, applied in linear light.
+
+This tool is meant to be safe to leave enabled on every clip. Anything it does
+not positively understand is passed straight through, untouched and uncopied:
+footage with no metadata, a lens that isn't in the database below, an aperture
+it can't parse or that the lens couldn't have produced, or an image that isn't
+in linear light. It says which of those happened in the Console.
+--]]--
+
+FuRegisterClass("ApertureNormalize", CT_Tool, {
+	REGS_Name             = "Aperture Normalize",
+	REGS_Category         = "Fuses\\Metadata",
+	REGS_OpIconString     = "ANrm",
+	REGS_OpDescription    = "Normalises variable-aperture lenses to a target aperture",
+	REG_NoMotionBlurCtrls = true,
+	REG_OpNoMask          = true,
+	REG_NoPreCalcProcess  = true,
+	REG_SupportsDoD       = true,
+	REG_Fuse_NoJIT        = true,
+})
+
+-- ---------------------------------------------------------------------------
+-- Lens database
+-- ---------------------------------------------------------------------------
+--
+-- Keyed by the "lens_type" metadata string. Lookup collapses whitespace and
+-- ignores case, but is otherwise exact -- a lens that isn't listed here gets
+-- passed through untouched, which is the entire point of the table: it is what
+-- makes this filter safe to enable on every clip in a timeline.
+--
+-- Per-lens fields:
+--
+--   aperture_range  {widest, narrowest} marked f-numbers. An aperture outside
+--                   this couldn't have come from this lens, so it is treated
+--                   as bad metadata and the frame is passed through.
+--
+--   stops           Optional {[f_number] = correction_in_stops}. The inverse
+--                   square law assumes the marked f-number equals the actual
+--                   transmission, which real glass only approximates; this is
+--                   where measured deviation goes, added on top of the
+--                   computed correction and linearly interpolated between the
+--                   f-numbers given. Leave nil until it has actually been
+--                   measured -- guessing here is worse than not correcting.
+--
+local LENSES = {
+	["Canon EF-S 10-22mm f/3.5-4.5 USM"] = {
+		aperture_range = { 3.5, 29 },
+		stops = nil,
+	},
+}
+
+-- Refuse to apply a correction larger than this. Nothing legitimate about a
+-- variable-aperture zoom needs multiple stops; a number this big means the
+-- metadata is wrong, and quietly blowing out a shot is worse than doing
+-- nothing.
+local MAX_STOPS = 3.0
+
+local function lensKey(s)
+	s = tostring(s):lower()
+	s = s:gsub("%s+", " ")
+	s = s:gsub("^ +", ""):gsub(" +$", "")
+	return s
+end
+
+-- Normalised view of the table above, built once.
+local LENSES_BY_KEY = {}
+for name, lens in pairs(LENSES) do
+	LENSES_BY_KEY[lensKey(name)] = { name = name, lens = lens }
+end
+
+local function log2(x)
+	return math.log(x) / math.log(2)
+end
+
+-- Accepts the shapes cameras actually write: "f3.5", "F/3.5", "3.5", "T2.8".
+local function parseAperture(s)
+	if type(s) ~= "string" and type(s) ~= "number" then return nil end
+	local n = tostring(s):match("^%s*[fFtT]?%s*/?%s*(%d+%.?%d*)%s*$")
+	return tonumber(n)
+end
+
+local function interpolateStops(tbl, n)
+	if type(tbl) ~= "table" then return 0 end
+
+	local keys = {}
+	for k in pairs(tbl) do keys[#keys + 1] = k end
+	if #keys == 0 then return 0 end
+	table.sort(keys)
+
+	if n <= keys[1] then return tbl[keys[1]] end
+	if n >= keys[#keys] then return tbl[keys[#keys]] end
+
+	for i = 1, #keys - 1 do
+		local a, b = keys[i], keys[i + 1]
+		if n >= a and n <= b then
+			return tbl[a] + (tbl[b] - tbl[a]) * ((n - a) / (b - a))
+		end
+	end
+
+	return 0
+end
+
+-- Decides what to do with a frame. Returns a table describing the outcome:
+-- either { skip = "reason" } or { stops = .., gain = .., ... }. Kept separate
+-- from Process so it can be tested without a Fusion host.
+local function plan(meta, target)
+	if type(meta) ~= "table" then
+		return { skip = "the image carries no metadata" }
+	end
+
+	if type(target) ~= "number" or target <= 0 then
+		return { skip = "the target aperture is not a usable f-number" }
+	end
+
+	local lensName = meta.lens_type
+	if lensName == nil or tostring(lensName) == "" then
+		return { skip = "the metadata has no lens_type" }
+	end
+
+	local entry = LENSES_BY_KEY[lensKey(lensName)]
+	if not entry then
+		return { skip = 'lens "' .. tostring(lensName) .. '" is not in the lens database' }
+	end
+
+	local aperture = parseAperture(meta.aperture)
+	if not aperture then
+		if meta.aperture == nil then
+			return { skip = "the metadata has no aperture" }
+		end
+		return { skip = 'cannot read the aperture "' .. tostring(meta.aperture) .. '"' }
+	end
+
+	local range = entry.lens.aperture_range
+	if range and (aperture < range[1] or aperture > range[2]) then
+		return { skip = string.format("f%s is outside the f%s-f%s this lens can do",
+			tostring(aperture), tostring(range[1]), tostring(range[2])) }
+	end
+
+	-- A gain is only meaningful on linear light. Fusion reports the encoding
+	-- in GammaSpace.Gamma, and for BRAW through a colour-managed comp it is 1.
+	-- Anything else would need linearising first, which is a different job, so
+	-- say so rather than silently applying a wrong correction.
+	local gammaSpace = meta.GammaSpace
+	if type(gammaSpace) == "table" and gammaSpace.Gamma ~= nil then
+		local gamma = tonumber(gammaSpace.Gamma)
+		if gamma and math.abs(gamma - 1.0) > 0.001 then
+			return { skip = string.format("the image is gamma %s encoded, not linear", tostring(gamma)) }
+		end
+	end
+
+	local stops = 2 * log2(aperture / target) + interpolateStops(entry.lens.stops, aperture)
+
+	if math.abs(stops) > MAX_STOPS then
+		return { skip = string.format("a %.2f stop correction is too large to be believable", stops) }
+	end
+
+	return {
+		lens = entry.name,
+		aperture = aperture,
+		target = target,
+		stops = stops,
+		gain = 2 ^ stops,
+	}
+end
+
+local function toolName()
+	local ok, attrs = pcall(function() return self:GetAttrs() end)
+	if ok and type(attrs) == "table" and attrs.TOOLS_Name then
+		return attrs.TOOLS_Name
+	end
+	return "ApertureNormalize"
+end
+
+local function buildReport(frame, decision)
+	local out = {}
+	out[#out + 1] = "-- Aperture Normalize [" .. toolName() .. "] frame " .. tostring(frame) .. " --"
+
+	if decision.skip then
+		out[#out + 1] = "  passing through: " .. decision.skip
+	else
+		out[#out + 1] = "  lens       : " .. decision.lens
+		out[#out + 1] = string.format("  aperture   : f%s -> target f%s",
+			tostring(decision.aperture), tostring(decision.target))
+		out[#out + 1] = string.format("  correction : %+.3f stops (gain %.4f)",
+			decision.stops, decision.gain)
+	end
+
+	return table.concat(out, "\n")
+end
+
+-- What makes a report worth repeating. The frame number is deliberately not
+-- part of it: on a zoom the aperture changes every few frames and that is
+-- exactly what we want to see, but a static shot should report once.
+local function signature(decision)
+	if decision.skip then
+		return "skip:" .. decision.skip
+	end
+	return string.format("%s|%s|%s", decision.lens, tostring(decision.aperture), tostring(decision.target))
+end
+
+-- Record what was done in the output metadata, so a downstream Aperture Probe
+-- (or its CSV dump) shows the correction alongside the values it came from.
+local function stamp(img, decision)
+	local meta = {}
+	if type(img.Metadata) == "table" then
+		-- Shallow copy: nested tables are shared but never mutated, and
+		-- writing into the input's own table would corrupt a cached image.
+		for k, v in pairs(img.Metadata) do meta[k] = v end
+	end
+
+	meta.aperture_normalize = {
+		gain = string.format("%.6f", decision.gain),
+		stops = string.format("%.4f", decision.stops),
+		from = string.format("f%s", tostring(decision.aperture)),
+		target = string.format("f%s", tostring(decision.target)),
+		lens = decision.lens,
+	}
+
+	img.Metadata = meta
+end
+
+local lastSignature = nil
+
+function Create()
+	InImage = self:AddInput("Input", "Input", {
+		LINKID_DataType = "Image",
+		LINK_Main = 1,
+	})
+
+	OutImage = self:AddOutput("Output", "Output", {
+		LINKID_DataType = "Image",
+		LINK_Main = 1,
+	})
+
+	InTarget = self:AddInput("Target Aperture", "TargetAperture", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "SliderControl",
+		INP_Default = 4.0,
+		INP_MinScale = 1.0,
+		INP_MaxScale = 22.0,
+		INP_MinAllowed = 0.5,
+		INP_MaxAllowed = 64.0,
+	})
+
+	InWhen = self:AddInput("Report", "Report", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "ComboControl",
+		INP_Default = 0.0,
+		INP_Integer = true,
+		{ CCS_AddString = "When It Changes", },
+		{ CCS_AddString = "Every Frame", },
+		{ CCS_AddString = "Never", },
+		CC_LabelPosition = "Vertical",
+	})
+end
+
+function Process(req)
+	local img = InImage:GetValue(req)
+	local decision = plan(img.Metadata, InTarget:GetValue(req).Value)
+
+	local when = InWhen:GetValue(req).Value
+	if when ~= 2 then
+		local sig = signature(decision)
+		if when == 1 or sig ~= lastSignature then
+			lastSignature = sig
+			print(buildReport(req:GetTime(), decision))
+		end
+	end
+
+	if decision.skip then
+		-- Pass the original image straight through: no copy, no metadata
+		-- change, nothing for a downstream tool to notice.
+		OutImage:Set(req, img)
+		return
+	end
+
+	local out = img:CopyOf()
+	-- Alpha is coverage, not light, so it is deliberately left alone.
+	out:Gain(decision.gain, decision.gain, decision.gain, 1.0)
+	stamp(out, decision)
+
+	OutImage:Set(req, out)
+end

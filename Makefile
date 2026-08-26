@@ -23,7 +23,7 @@ LUA ?= luajit
 
 FUSES := $(wildcard Fuses/*.fuse)
 LUA_SOURCES := $(wildcard test/*.lua)
-TESTS := test/test_apertureprobe.lua
+TESTS := $(wildcard test/test_*.lua)
 
 UNAME_S := $(shell uname -s)
 
@@ -97,7 +97,12 @@ check:
 test:
 	@command -v $(LUA) >/dev/null 2>&1 || \
 		{ echo "$(LUA) not found; install a Lua 5.1-compatible interpreter or set LUA=" >&2; exit 1; }
-	@$(LUA) $(TESTS)
+	@fail=0; \
+	for t in $(TESTS); do \
+		echo "== $$t"; \
+		$(LUA) "$$t" || fail=1; \
+	done; \
+	exit $$fail
 
 install: MODE := $(DEFAULT_MODE)
 install-copy: MODE := copy

@@ -2,20 +2,85 @@
 
 Fusion fuses for dealing with variable-aperture lenses in DaVinci Resolve.
 
-A zoom lens sold as, say, 18-55mm f/3.5-5.6 loses light as you zoom in: push
+A zoom lens sold as, say, 10-22mm f/3.5-4.5 loses light as you zoom in: push
 from wide to long during a shot and the image darkens, in a ramp that has
-nothing to do with the scene. The eventual goal here is a fuse that undoes that
-ramp automatically.
+nothing to do with the scene. **Aperture Normalize** undoes that ramp.
 
-Doing that *well* depends on a question nobody seems to have written down: does
-Resolve hand the aperture through to Fusion as image metadata? If it does, the
-correction can be driven directly from what the lens reported, which beats
-inferring exposure changes from the pixels. If it doesn't, the correction has
-to be image-analysis based instead.
+Doing it well depended on a question nobody seems to have written down: does
+Resolve hand the aperture through to Fusion as image metadata? It turns out
+that for BRAW it does, in quantity —
 
-So the first tool here is a probe that answers that question.
+```
+aperture = f3.5
+focal_length = 10mm
+lens_type = Canon EF-S 10-22mm f/3.5-4.5 USM
+```
+
+— so the correction is driven by what the lens actually reported, rather than
+inferred from the pixels. **Aperture Probe** is the diagnostic that established
+that, and is still the tool for finding out what a given camera tags.
 
 ## Fuses
+
+### Aperture Normalize
+
+The correction itself. It reads the aperture the camera recorded for each
+frame, and applies the gain that would have made it look like it was shot at a
+target aperture — f/4 by default, the middle of the 10-22mm's range.
+
+Illuminance at the sensor goes as 1/N² for an f-number N, so matching a frame
+shot at N to the target is a gain of `(N / target)²`. At f/3.5 against a f/4
+target that's ×0.766, a third of a stop darker; at f/4.5 it's ×1.266 brighter.
+The gain is applied to R, G and B but not alpha, which is coverage rather than
+light.
+
+**It is meant to be safe to leave enabled on every clip.** Anything it does not
+positively understand is passed through untouched and uncopied, with the reason
+printed once to the Console:
+
+- the image carries no metadata, or no `lens_type`, or no `aperture`
+- the lens isn't in the database below
+- the aperture can't be parsed, or is one the lens couldn't have produced
+- the image isn't in linear light (a gain is only meaningful there)
+- the correction works out larger than 3 stops, which means the metadata is
+  lying rather than that the shot needs it
+
+When it *does* correct, it stamps `aperture_normalize.{gain,stops,from,target,lens}`
+into the output metadata, so an Aperture Probe placed downstream — or its CSV
+dump — shows the correction next to the values it came from.
+
+| Control | What it does |
+| --- | --- |
+| Target Aperture | The f-number to normalise to. Default 4. |
+| Report | *When It Changes* (default), *Every Frame*, or *Never*. |
+
+#### The lens database
+
+Near the top of `Fuses/ApertureNormalize.fuse`:
+
+```lua
+local LENSES = {
+	["Canon EF-S 10-22mm f/3.5-4.5 USM"] = {
+		aperture_range = { 3.5, 29 },
+		stops = nil,
+	},
+}
+```
+
+Keyed by the `lens_type` metadata string. Lookup collapses whitespace and
+ignores case but is otherwise exact, so an unlisted lens is passed through —
+that's what makes the filter safe to apply globally.
+
+`aperture_range` is the pair of marked f-numbers the lens can actually reach.
+An aperture outside it is treated as bad metadata rather than as a very large
+correction.
+
+`stops` is optional and unset so far. The inverse-square law assumes the marked
+f-number equals actual transmission, which real glass only approximates; this
+is where measured deviation goes, as `{[f_number] = correction_in_stops}`,
+interpolated between the points given and added on top of the computed
+correction. Use the Aperture Probe's CSV dump to measure it. It's better to
+leave it nil than to guess.
 
 ### Aperture Probe
 

@@ -6,30 +6,17 @@ Run with:  lua test/test_apertureprobe.lua   (from the repository root)
 
 package.path = "test/?.lua;" .. package.path
 local harness = require("harness")
+local tap = require("tap")
 
 local FUSE = "Fuses/ApertureProbe.fuse"
 
-local passed, failed = 0, 0
-
-local function check(name, ok, detail)
-	if ok then
-		passed = passed + 1
-		print("  ok    " .. name)
-	else
-		failed = failed + 1
-		print("  FAIL  " .. name .. (detail and ("\n        " .. tostring(detail)) or ""))
-	end
-end
-
-local function contains(haystack, needle)
-	return haystack ~= nil and haystack:find(needle, 1, true) ~= nil
-end
+local check, contains = tap.check, tap.contains
 
 local function newProbe()
 	return harness.load(FUSE)
 end
 
-print("registration")
+tap.section("registration")
 do
 	local probe = newProbe()
 	local reg = probe.registration
@@ -38,14 +25,14 @@ do
 	check("has a display name", reg and reg.attrs.REGS_Name == "Aperture Probe")
 end
 
-print("pass-through")
+tap.section("pass-through")
 do
 	local probe = newProbe()
 	local _, out, img = probe:process({ Filename = "/clips/a.braw" }, 1)
 	check("output is the input image, untouched", out == img)
 end
 
-print("no metadata")
+tap.section("no metadata")
 do
 	local probe = newProbe()
 	local report = probe:process(nil, 1)
@@ -56,7 +43,7 @@ do
 	check("says table is empty", contains(report2, "metadata table present but empty"), report2)
 end
 
-print("aperture detection")
+tap.section("aperture detection")
 do
 	local probe = newProbe()
 	local report = probe:process({ Aperture = "4.0", Filename = "/clips/a.braw" }, 7)
@@ -67,7 +54,7 @@ do
 		contains(report, "everything else:") and contains(report, "Filename = /clips/a.braw"), report)
 end
 
-print("key normalisation")
+tap.section("key normalisation")
 do
 	-- These should all be recognised as the aperture despite the spelling.
 	for _, key in ipairs({ "F-Number", "f_stop", "FNumber", "fstop", "T-Stop", "IrisValue", "ApertureValue" }) do
@@ -84,7 +71,7 @@ do
 	end
 end
 
-print("lens / exposure fields")
+tap.section("lens / exposure fields")
 do
 	local probe = newProbe()
 	local report = probe:process({ ISO = "800", ShutterAngle = "180", Filename = "/a.braw" }, 1)
@@ -94,7 +81,7 @@ do
 	check("still says aperture missing", contains(report, "APERTURE: none found"), report)
 end
 
-print("nested metadata")
+tap.section("nested metadata")
 do
 	local probe = newProbe()
 	local report = probe:process({ Lens = { FocalLength = "35", Aperture = "1.8" } }, 1)
@@ -107,7 +94,7 @@ do
 	check("marks empty subtables", contains(report2, "Empty = <empty table>"), report2)
 end
 
-print("circular metadata does not hang")
+tap.section("circular metadata does not hang")
 do
 	local meta = { Filename = "/a.braw" }
 	meta.Self = meta
@@ -116,7 +103,7 @@ do
 	check("notes the cycle", contains(report, "<circular reference>"), report)
 end
 
-print("report modes")
+tap.section("report modes")
 do
 	-- Default mode 0, "When It Changes": TimeCode churn must not re-trigger.
 	local probe = newProbe()
@@ -159,7 +146,7 @@ do
 	check("Never still passes the image through", out == img)
 end
 
-print("List Every Field")
+tap.section("List Every Field")
 do
 	local probe = newProbe()
 	probe:set("DumpAll", 0)
@@ -206,7 +193,7 @@ local BRAW = {
 	iso = "400",
 }
 
-print("logging is opt-in")
+tap.section("logging is opt-in")
 do
 	freshLogDir()
 	local probe = newProbe()
@@ -215,7 +202,7 @@ do
 	check("writes nothing by default", readFile(LOGDIR .. "/A067_08211340_C007.csv") == nil)
 end
 
-print("logging writes csv and log")
+tap.section("logging writes csv and log")
 do
 	freshLogDir()
 	local probe = newProbe()
@@ -233,7 +220,7 @@ do
 	check("writes the log too", log ~= nil and log:find("APERTURE:", 1, true) ~= nil, log)
 end
 
-print("log records every frame exactly once")
+tap.section("log records every frame exactly once")
 do
 	freshLogDir()
 	local probe = newProbe()
@@ -248,7 +235,7 @@ do
 	check("only one header", occurrences(csv, "frame,field,value") == 1, csv)
 end
 
-print("log ignores the Report setting")
+tap.section("log ignores the Report setting")
 do
 	freshLogDir()
 	local probe = newProbe()
@@ -260,7 +247,7 @@ do
 		readFile(LOGDIR .. "/A067_08211340_C007.csv") ~= nil)
 end
 
-print("csv escaping")
+tap.section("csv escaping")
 do
 	freshLogDir()
 	local probe = newProbe()
@@ -272,7 +259,7 @@ do
 		csv and csv:find('"has, a comma and ""quotes"""', 1, true) ~= nil, csv)
 end
 
-print("clip naming")
+tap.section("clip naming")
 do
 	freshLogDir()
 	local probe = newProbe()
@@ -282,7 +269,7 @@ do
 		readFile(LOGDIR .. "/aperture-probe.csv") ~= nil)
 end
 
-print("Start Log Over")
+tap.section("Start Log Over")
 do
 	freshLogDir()
 	local probe = newProbe()
@@ -300,6 +287,4 @@ end
 
 os.execute("rm -rf " .. TMP)
 
-print("")
-print(string.format("%d passed, %d failed", passed, failed))
-os.exit(failed == 0 and 0 or 1)
+tap.finish()
