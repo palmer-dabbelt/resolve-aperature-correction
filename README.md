@@ -135,9 +135,15 @@ footage rather than argued about:
 
 Every mode but the last one moves the whole frame through Lua. Even where the
 arithmetic is a single native call, a 6K RGBA float frame is a few hundred
-megabytes to allocate and copy, per frame — which is the cost worth suspecting
-first when playback is slow, since it does not depend on how simple the
-correction is.
+megabytes to allocate and copy, per frame — and that cost does not depend on
+how simple the correction is.
+
+That copy turned out to be effectively the whole cost. On 6K BRAW the three
+pixel-touching modes all played at roughly 7–17fps and differed little from
+each other, while *publish gain only* plays at a full 23.976. It is worth
+knowing that the modes were close together: it means there was nothing to win
+by making the multiply itself cheaper, which is why the GPU kernel was not the
+answer either.
 
 So the tool has a second output, **Gain**, carrying the correction as a plain
 number. Set Processing to *Off: publish gain only*, put a BrightnessContrast
